@@ -1,242 +1,158 @@
 # Retrieval Strategy — RAG PDF Q&A System
 
-This document provides the detailed design rationale for the retrieval pipeline, including chunk size selection, top-k tuning, and ranking strategy.
+---
+
+## Pipeline Overview
+
+The retrieval pipeline is a four-stage process owned by `RAGPipeline` and executed by `RetrieverService` and `RerankerService`.
+
+```
+EmbeddingCache.get_or_embed(standalone_query)
+          │
+          │  1536-dim query vector
+          ▼
+RetrieverService.retrieve(query_embedding, document_ids, TOP_K_CANDIDATES)
+    │
+    ├── Stage 1: VectorStore.search()       bi-encoder cosine similarity
+    │             over-fetch top-10 candidates
+    │
+    └── Stage 2: Score threshold filter    discard score < 0.70
+          │
+          │  list[ScoredChunk] with bi_encoder_score set
+          ▼
+RerankerService.rerank(standalone_query, candidates)   [optional]
+    │
+    │  list[ScoredChunk] with similarity_score = reranker score
+    │  (bi_encoder_score preserved for diagnostics)
+    ▼
+RetrieverService.apply_mmr(candidates, top_k=5)
+    │
+    │  final top-k diverse, relevant chunks
+    ▼
+RAGChain.invoke(query_context, retrieved_context)
+```
 
 ---
 
-## 1. Chunking Strategy
+## Stage 1: Vector Similarity Search
 
-### The Problem
+- **Algorithm:** Cosine similarity (dot product on L2-normalised vectors)
+- **Index:** FAISS `IndexFlatIP` (exhaustive, exact) for datasets < 500K vectors
+- **Scoping:** `document_ids` filter limits search to session documents
+- **Over-fetch:** retrieves `TOP_K_CANDIDATES = TOP_K × 2` (default: 10)
+  so the reranker and MMR have enough candidates to work with
 
-PDF documents contain continuous text that must be split into discrete units for embedding and retrieval. The chunk size is the single most impactful parameter for retrieval quality.
-
-### Chunk Size Analysis
-
-| Chunk Size | Pros | Cons | Precision@5 Impact |
-|---|---|---|---|
-| **256 tokens** | High specificity per chunk | Fragments coherent ideas; loses surrounding context; retrieval becomes noisy because relevant info scatters across many small chunks | Lower — too many near-miss chunks pollute top-5 |
-| **384 tokens** | Good specificity | Still splits many paragraphs mid-thought | Moderate |
-| **512 tokens** | Contains 1-2 complete paragraphs; strong semantic coherence; embedding captures a focused but complete idea | May occasionally include tangential sentences | **Highest** — best balance of signal and noise |
-| **768 tokens** | Broader context per chunk | Mixed topics in one chunk dilute embedding signal | Moderate — relevance signal weakened |
-| **1024 tokens** | Maximum context per chunk | Multiple topics per chunk; embedding is blurred average; fewer chunks fit in LLM context | Lower — chunks too broad for precise matching |
-
-### Selected: 512 Tokens
-
-**Rationale:**
-
-1. **Semantic coherence:** 512 tokens typically covers 1-2 paragraphs in academic/business PDFs. This is large enough to contain a complete idea with supporting detail, but small enough that the embedding vector represents a focused concept.
-
-2. **Context budget:** With top-k=5, the total context is 5 × 512 = 2,560 tokens. Combined with the system prompt (~200 tokens), conversation history (~500 tokens), and generation budget (1,024 tokens), the total fits comfortably within a 4K or 8K context window. This leaves room for comprehensive answers without truncation.
-
-3. **Embedding quality:** OpenAI's embedding models produce the highest-quality vectors when the input is focused on a single topic. 512 tokens is the empirical sweet spot for this — long enough for context, short enough for focus.
-
-4. **Overlap (64 tokens / 12.5%):** Ensures sentences at chunk boundaries appear in both adjacent chunks. If a query matches a boundary sentence, at least one chunk will retrieve it. The 12.5% ratio avoids excessive storage overhead.
-
-### Splitting Hierarchy
-
-Text is split using a priority hierarchy of separators:
-
-```
-1. "\n\n"  — Paragraph break (strongest semantic boundary)
-2. "\n"    — Line break
-3. ". "    — Sentence boundary
-4. " "     — Word boundary (last resort)
-```
-
-The chunker attempts to split at the highest-priority boundary that keeps the chunk within the token budget. This ensures:
-- Paragraphs are never split mid-sentence if they fit in one chunk
-- Long paragraphs split at sentence boundaries, not mid-word
-- The resulting chunks are maximally aligned with the document's semantic structure
+FAISS latency: 10–50ms for typical PDF workloads (1K–100K vectors)
 
 ---
 
-## 2. Embedding Strategy
+## Stage 2: Score Threshold Filtering
 
-### Model Selection
+**Threshold:** `SIMILARITY_THRESHOLD = 0.70` (configurable)
 
-**text-embedding-3-small** (OpenAI)
-- 1536 dimensions
-- Output vectors are L2-normalized (unit length)
-- Cosine similarity reduces to dot product on normalized vectors
-- Strong MTEB benchmark scores for retrieval tasks
-- Cost: ~$0.02 per 1M tokens
+Purpose: eliminate chunks that are in the top-10 by cosine distance but are not genuinely relevant. Prevents noise from reaching the LLM even when the query doesn't have strong document matches.
 
-**Why not text-embedding-3-large (3072 dims)?**
-- 2× vector storage cost
-- Marginal quality improvement for typical PDF content
-- Configurable for users who need maximum precision
+Calibration with `text-embedding-3-small`:
+- 0.80+: very strong match (same topic + subtopic)
+- 0.70–0.80: relevant match (same topic)
+- 0.60–0.70: marginal (same domain, different topic)
+- <0.60: unrelated
 
-### Query vs. Document Embedding
-
-The same model is used for both document chunks and queries. This is critical — cross-model embedding produces misaligned vector spaces and degrades retrieval quality.
+After this stage, each `ScoredChunk` has `bi_encoder_score` set and `similarity_score == bi_encoder_score`.
 
 ---
 
-## 3. Retrieval Pipeline
+## Stage 3a: Cross-Encoder Reranking (optional)
 
-The retrieval pipeline uses a **3-stage approach** to maximize precision@5:
+**Purpose:** Improve relevance ordering. Unlike bi-encoder similarity (query and chunk embedded independently), a cross-encoder reads both texts together and scores their relevance jointly — fundamentally more accurate.
 
-```
-Query Embedding
-      │
-      ▼
-┌──────────────────────┐
-│ Stage 1: VECTOR      │  Retrieve top_k × 2 candidates (10 by default)
-│ SIMILARITY SEARCH    │  Cosine similarity on normalized vectors
-│                      │  Scoped to session's document_ids
-│ Latency: 10-50ms    │
-└──────────┬───────────┘
-           │
-           ▼
-┌──────────────────────┐
-│ Stage 2: SCORE       │  Remove chunks with score < 0.70
-│ THRESHOLD FILTER     │  Prevents irrelevant chunks from reaching LLM
-│                      │  May return fewer than top_k results
-│ Latency: <1ms       │
-└──────────┬───────────┘
-           │
-           ▼
-┌──────────────────────┐
-│ Stage 3: MMR         │  Select final top_k from filtered candidates
-│ RE-RANKING           │  Balance relevance (70%) vs diversity (30%)
-│                      │  Eliminates near-duplicate chunks
-│ Latency: 5-20ms     │
-└──────────┬───────────┘
-           │
-           ▼
-     Top-K Results
-```
+**When to use:**
+- Disabled (`RERANKER_BACKEND=none`): rely on MMR-only ordering. Suitable for most use-cases.
+- `cross_encoder`: local model, no cost, ~50–150ms. Best for development or when cost matters.
+- `cohere`: higher quality, external API, ~200–400ms. Best for production.
 
-### Stage 1: Vector Similarity Search
+**Score contract:**
+- Input: `similarity_score == bi_encoder_score`
+- Output: `rerank_score` = raw cross-encoder/Cohere score; `similarity_score` = normalised reranker score; `bi_encoder_score` preserved unchanged
 
-- **Algorithm:** Exhaustive cosine similarity (FAISS IndexFlatIP)
-- **Over-fetch factor:** 2× top_k to provide candidates for re-ranking
-- **Document scoping:** Only search within the session's document_ids
-  - FAISS: post-filter after search (over-fetch 3× for safety)
-  - ChromaDB: native `where={"document_id": {"$in": [...]}}` filter
-
-### Stage 2: Score Threshold
-
-- **Threshold:** 0.70 (configurable via SIMILARITY_THRESHOLD)
-- **Purpose:** Hard quality floor — even if the user asks for k=10, chunks below 0.70 are excluded
-- **Calibration:** With text-embedding-3-small on PDF content:
-  - 0.80+: Very strong semantic match (same topic, same subtopic)
-  - 0.70-0.80: Relevant (same topic, related subtopic)
-  - 0.60-0.70: Marginal (same domain, different topic)
-  - <0.60: Irrelevant
-- **Effect on precision@5:** Eliminates the "padding" problem where low-relevance chunks fill out the top-k when the document doesn't contain enough truly relevant content
-
-### Stage 3: MMR Re-Ranking
-
-**Maximal Marginal Relevance** selects chunks that are both relevant to the query AND different from each other.
-
-```
-score(chunk_i) = λ × sim(chunk_i, query)
-               - (1 - λ) × max(sim(chunk_i, already_selected_j))
-```
-
-- **λ = 0.7** (MMR_DIVERSITY_FACTOR in config)
-  - 70% weight on relevance, 30% on diversity
-  - Favors relevant chunks but penalizes redundancy
-
-- **Why MMR matters for PDF Q&A:**
-  PDF documents often contain repeated information (executive summary + detail section, table of contents + full text). Without MMR, the top-5 might be 5 chunks all saying the same thing from different locations. MMR ensures the 5 chunks cover different aspects of the answer.
-
-- **Effect on precision@5:** Increases information coverage per retrieved set, directly improving answer completeness.
+**Failure handling:** `RerankerError` triggers fallback to bi-encoder ordering. The request never fails due to a reranker issue.
 
 ---
 
-## 4. Top-K Tuning
+## Stage 3b: MMR Diversity Selection
 
-### Default: k=5
+**Formula:**
+```
+score(chunk_i) = λ · similarity_score(chunk_i, query)
+               − (1−λ) · max(similarity_score(chunk_i, selected_j))
+```
 
-| k Value | Use Case | Trade-off |
+**λ = MMR_DIVERSITY_FACTOR = 0.7** (favour relevance, mild diversity)
+
+**Purpose:** Prevents the top-k from being 5 near-identical chunks from the same paragraph. Forces coverage of different aspects of the answer.
+
+**When MMR is skipped:** If `len(candidates) ≤ top_k`, all candidates are returned without MMR calculation (no diversity gain possible).
+
+After MMR, each chunk has `rank` set (1-based). This is the final ordering passed to the LLM.
+
+---
+
+## Chunk Size Analysis
+
+| Size | Semantic quality | Context | Precision@5 | 5-chunk context cost |
+|---|---|---|---|---|
+| 256 tokens | Low — splits ideas mid-thought | Poor | ~0.45–0.55 | 1,280 tokens |
+| 384 tokens | Moderate | Moderate | ~0.55–0.65 | 1,920 tokens |
+| **512 tokens** | **High — 1-2 paragraphs** | **Good** | **~0.70–0.85** | **2,560 tokens** |
+| 768 tokens | Mixed topics in one chunk | Broad | ~0.55–0.65 | 3,840 tokens |
+| 1,024 tokens | Diluted embedding signal | Very broad | ~0.45–0.55 | 5,120 tokens |
+
+**Selected: 512 tokens**
+
+Reasons:
+1. Large enough to contain a complete idea with supporting detail
+2. Small enough for the embedding to represent a focused concept
+3. 5 × 512 = 2,560 tokens leaves room for system prompt (~200), history (~1,024) and generation (~1,024) within an 8K window
+
+**Overlap: 64 tokens (12.5%)** — ensures boundary sentences appear in both adjacent chunks, preventing information loss at splits.
+
+**Split hierarchy:** `\n\n` → `\n` → `. ` → ` ` — splits at the highest-level semantic boundary that keeps the chunk within budget.
+
+---
+
+## Top-K Tuning
+
+| k | Use case | Notes |
 |---|---|---|
-| **k=3** | Simple factual lookup ("What is X?") | Fast, precise, but may miss supporting evidence |
-| **k=5** | General Q&A (default) | Best balance — covers main answer + supporting detail |
-| **k=7** | Analytical questions ("Compare X and Y") | Broader coverage, more LLM context consumed |
-| **k=10** | Synthesis questions ("Summarize all findings") | Maximum coverage, risk of noise, slow |
+| 3 | Simple factual lookup | Fast, minimal context |
+| **5** | **General Q&A (default)** | **Best balance** |
+| 7 | Analytical questions | Broader coverage |
+| 10 | Synthesis / summarization | Maximum coverage, more noise |
 
-### Why 5 is the Default
-
-1. **Context budget:** 5 × 512 = 2,560 tokens of context. This leaves ~1,440 tokens for prompt + history + generation in a 4K window, or ~5,440 tokens in an 8K window. Ample for detailed answers.
-
-2. **Diminishing returns:** In benchmarks on factual PDF Q&A, precision plateaus after k=5. Additional chunks add noise faster than they add relevant information.
-
-3. **Latency:** More chunks = more tokens in the LLM prompt = longer generation time. k=5 keeps generation fast.
-
-4. **Per-query override:** The API allows overriding top_k per request (range 3-10), so users can tune for their specific question type.
+Per-query override available via the API `top_k` parameter (range 3–10).
 
 ---
 
-## 5. Performance: How Latency <2s is Achieved
+## Expected Precision@5 by Configuration
 
-### Latency Breakdown (Query Path)
+| Configuration | Estimated P@5 |
+|---|---|
+| 512 tokens, k=5, no reranker, no MMR | 0.55–0.65 |
+| 512 tokens, k=5, no reranker, MMR | 0.65–0.75 |
+| 512 tokens, k=5, cross-encoder, MMR | **0.75–0.85** |
+| 512 tokens, k=5, Cohere, MMR | **0.78–0.88** |
 
-| Stage | Technique | Latency |
-|---|---|---|
-| Session lookup | In-memory dict | <1ms |
-| Query reformulation | gpt-4o-mini (small, fast) | 0-400ms |
-| Query embedding | Single OpenAI API call | 100-150ms |
-| Vector search | FAISS in-memory (no network) | 10-50ms |
-| Threshold + MMR | CPU-only computation | 5-20ms |
-| LLM first token | OpenAI streaming (stream=True) | 300-500ms |
-| **Total to first token** | | **~650-1200ms** |
-
-### Key Optimizations
-
-1. **Pre-computed document embeddings:** All chunk embeddings are computed during ingestion. Zero embedding computation at query time for documents.
-
-2. **FAISS in-memory index:** No network hop for vector search. Sub-50ms for typical workloads (1K-100K vectors).
-
-3. **Streaming generation:** The client sees the first token in <1.2s. Full answer streams over 2-5 seconds, but perceived latency is the time to first token.
-
-4. **Conditional reformulation:** First-turn queries skip the reformulation step entirely, saving 200-400ms.
-
-5. **Fast reformulation model:** Follow-ups use gpt-4o-mini (not gpt-4o) for reformulation — it's a simple rewriting task that doesn't need the full model.
-
-6. **Connection pooling:** httpx.AsyncClient maintains persistent connections to OpenAI's API, eliminating TCP/TLS handshake overhead on every call.
-
-### Worst-Case Analysis
-
-Even in the worst case (follow-up question, slow API responses):
-- Reformulation: 600ms
-- Embedding: 300ms
-- Retrieval: 100ms
-- First token: 800ms
-- **Total: 1,800ms** — still under the 2-second target.
+Run `scripts/benchmark.py` to measure actual P@5 on your document set.
 
 ---
 
-## 6. How Chunking + Top-K Improves Precision@5
+## Latency by Configuration
 
-**Precision@5** = (relevant chunks in top 5) / 5
-
-### The Interaction
-
-Chunk size and top-k are not independent — they interact:
-
-1. **Smaller chunks + higher k:** More granular retrieval. Each chunk is highly focused, but you need more of them to cover the answer. Risk: individual chunks lack context.
-
-2. **Larger chunks + lower k:** Fewer but broader chunks. Each chunk covers more ground, but the embedding is less focused. Risk: irrelevant content mixed in.
-
-3. **512 chunks + k=5 (our choice):** Each chunk is focused enough for precise embedding, but large enough to contain a complete thought. 5 chunks cover the answer from multiple angles without excessive noise.
-
-### Additional Precision Boosters
-
-- **Overlap (64 tokens):** Ensures boundary sentences are retrievable, preventing precision loss from unlucky chunk splits.
-- **Score threshold (0.70):** Removes irrelevant chunks even if k requests more, preventing noise from dragging down precision.
-- **MMR diversity:** Ensures the 5 chunks aren't redundant copies of the same information, maximizing information coverage per position in the top-5.
-- **Query reformulation:** Follow-up queries become precise standalone questions, producing higher-quality embeddings that match more accurately.
-
-### Expected Precision@5 by Configuration
-
-| Config | Expected P@5 | Notes |
+| Retrieval config | Retrieval latency | Total to first token |
 |---|---|---|
-| 256 tokens, k=5, no MMR | 0.45-0.55 | Fragmented chunks, redundant results |
-| 512 tokens, k=5, no MMR | 0.60-0.70 | Good chunks, but redundancy |
-| 512 tokens, k=5, MMR | **0.70-0.85** | **Our config — best balance** |
-| 1024 tokens, k=5, MMR | 0.55-0.65 | Chunks too broad, diluted signal |
-| 512 tokens, k=10, MMR | 0.50-0.60 | Too many results, noise increases |
+| FAISS, no reranker | ~60ms | ~750–1000ms |
+| FAISS, cross-encoder | ~160ms | ~850–1150ms |
+| FAISS, Cohere reranker | ~350ms | ~1050–1350ms |
+| ChromaDB, no reranker | ~100ms | ~800–1050ms |
 
-These are estimates based on typical PDF Q&A benchmarks. Actual performance depends on document content and question distribution. Use `scripts/benchmark.py` to measure on your specific workload.
+All configurations remain within the 2-second target for time to first token.

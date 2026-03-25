@@ -3,75 +3,118 @@ Retrieval Service
 ==================
 
 Purpose:
-    Performs semantic search over the vector database to find the most
-    relevant document chunks for a given query. This is the core of the
-    RAG pipeline's "R" (Retrieval).
+    Performs semantic search over the vector database given a pre-computed
+    query embedding, then applies score-threshold filtering and MMR diversity
+    selection. Returns a ranked list of candidate chunks.
 
-Pipeline Position:
-    User Question -> Reformulate -> Embed -> **Retrieve** -> Rank -> Generate
+    IMPORTANT — scope of this service:
+    ✓ Vector similarity search         (Stage 1)
+    ✓ Score threshold filtering        (Stage 2)
+    ✓ MMR diversity selection          (Stage 3, called separately)
+    ✗ Query embedding                  → EmbeddingCache / EmbeddingService
+    ✗ Cross-encoder reranking          → RerankerService
+    ✗ Session or document validation   → RAGPipeline
 
-Retrieval Strategy (3-Stage Pipeline):
+    The full ordered pipeline (owned by RAGPipeline):
+        EmbeddingCache.get_or_embed()         ← embedding
+        RetrieverService.retrieve()           ← stages 1 + 2
+        RerankerService.rerank()              ← optional, stage 3a
+        RetrieverService.apply_mmr()          ← stage 3b (diversity)
 
-    Stage 1: Candidate Retrieval (Vector Similarity)
-        - Embed the query via EmbeddingService.embed_query()
-        - Search vector DB for top-k * 2 nearest neighbors (over-fetch)
-        - Uses cosine similarity (vectors are pre-normalized)
-        - Document-scoped: filters by document_ids in the session
-        - Latency: ~10-50ms for FAISS, ~50-100ms for ChromaDB
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Stage Descriptions
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    Stage 1: Vector Similarity Search
+        Input: query_embedding (pre-computed 1536-dim vector)
+        Action: VectorStore.search(query_embedding, top_k=TOP_K_CANDIDATES,
+                                   document_ids=document_ids)
+        Returns: top TOP_K_CANDIDATES (query, chunk) cosine similarity pairs
+        Latency: ~10-50ms (FAISS) / ~50-100ms (ChromaDB)
+        Note: TOP_K_CANDIDATES = TOP_K * 2 (over-fetch for reranking/MMR)
 
     Stage 2: Score Threshold Filtering
-        - Discard any chunk with similarity score < SIMILARITY_THRESHOLD (0.70)
-        - Prevents low-relevance chunks from reaching the LLM even if fewer
-          than top-k chunks remain
-        - Threshold is calibrated: 0.70 with text-embedding-3-small provides
-          a good precision/recall balance for factual PDF content
+        Input: list[ScoredChunk] from stage 1
+        Action: discard any chunk where similarity_score < SIMILARITY_THRESHOLD
+        Effect: prevents low-relevance chunks reaching later stages even if
+                fewer than TOP_K_CANDIDATES remain after filtering
+        Note: sets bi_encoder_score = similarity_score on each ScoredChunk
 
-    Stage 3: MMR Re-Ranking (Maximal Marginal Relevance)
-        - From the filtered candidates, select the final top-k using MMR
-        - MMR balances relevance with diversity:
-          score(chunk) = lambda * similarity(chunk, query)
-                       - (1 - lambda) * max(similarity(chunk, already_selected))
-        - lambda (MMR_DIVERSITY_FACTOR): 0.7 (favor relevance, mild diversity)
-        - Effect: avoids returning 5 chunks that all say the same thing from
-          different pages; instead returns 5 chunks that cover different
-          aspects of the answer
+    Stage 3a (in RerankerService): Cross-Encoder Reranking (optional)
+        Not performed here. RAGPipeline calls RerankerService.rerank() after
+        retrieve() returns, if RERANKER_BACKEND != "none".
 
-Top-K Tuning Rationale:
-    Default: top_k = 5
+    Stage 3b: MMR Diversity Selection
+        Input: list[ScoredChunk] (already reranked, or raw filtered if no reranker)
+        Action: select final top_k chunks maximising:
+                score = λ · similarity_score − (1−λ) · max_sim_to_selected
+        Lambda: MMR_DIVERSITY_FACTOR (default 0.7 — favour relevance)
+        Effect: eliminates near-duplicate chunks; ensures diverse coverage
+        Latency: ~5-20ms (CPU, O(k·n) where n = candidates, k = top_k)
 
-    - k=3: Suitable for simple factual lookups ("What is X?"). Minimal
-      context, fast, but may miss supporting evidence.
-    - k=5: Default. Covers most question types. 5 chunks of 512 tokens =
-      ~2560 tokens of context, leaving ample room in a 4K budget for the
-      prompt template, conversation history, and generated answer.
-    - k=7-10: For complex analytical questions requiring synthesis across
-      multiple sections. Uses more context window but provides broader
-      coverage.
-    - Configurable per-query via the API's top_k parameter.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Methods
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Inputs:
-    query_embedding: list[float]
-        The embedded query vector (1536 dimensions).
+    retrieve(
+        query_embedding: list[float],
+        document_ids: list[str],
+        top_k_candidates: int | None = None
+    ) -> tuple[list[ScoredChunk], RetrievalMetadata]:
+        Executes stages 1 and 2. Returns threshold-filtered candidates
+        ready for optional reranking and final MMR selection.
+        Inputs:
+            query_embedding   — 1536-dim pre-computed vector (caller's responsibility)
+            document_ids      — scope search to these documents only
+            top_k_candidates  — override candidate count; defaults to TOP_K_CANDIDATES
+        Outputs:
+            candidates: list[ScoredChunk] — filtered, NOT yet MMR-selected
+                        Each chunk has bi_encoder_score set.
+                        similarity_score == bi_encoder_score at this stage.
+            metadata: RetrievalMetadata (partial — reranker_applied=False,
+                        chunks_used=0; RAGPipeline fills these after MMR)
+        Raises:
+            StorageReadError   — vector store search failed
+            NoDocumentsError   — document_ids is empty
 
-    document_ids: list[str]
-        Scope retrieval to these documents only.
+    apply_mmr(
+        candidates: list[ScoredChunk],
+        top_k: int,
+        diversity_factor: float | None = None
+    ) -> list[ScoredChunk]:
+        Executes stage 3b (MMR diversity selection) on already-reranked
+        or threshold-filtered candidates.
+        Inputs:
+            candidates       — list[ScoredChunk] from retrieve() (+ optional reranking)
+            top_k            — final number of chunks to return
+            diversity_factor — override MMR lambda; defaults to MMR_DIVERSITY_FACTOR
+        Outputs:
+            list[ScoredChunk] of length ≤ top_k, in MMR-selected order.
+            rank field is set on each chunk (1-based).
+        Notes:
+            - If len(candidates) <= top_k, returns all candidates without MMR
+              (no diversity calculation needed).
+            - Uses similarity_score (which may be reranker score) for
+              both relevance and cross-similarity calculations.
 
-    top_k: int
-        Number of final chunks to return (after re-ranking).
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Top-K Tuning Rationale
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Outputs:
-    RetrievedContext:
-        - chunks: list[ScoredChunk] — ranked chunks with scores
-        - retrieval_metadata: dict with diagnostics:
-            - retrieval_time_ms: float
-            - candidates_considered: int
-            - candidates_after_threshold: int
-            - mmr_applied: bool
-            - similarity_scores: list[float]
+    Default: TOP_K=5 (final chunks to LLM), TOP_K_CANDIDATES=10 (over-fetch)
 
-Dependencies:
-    - app.db.vector_store (VectorStore interface)
-    - app.services.embedder (EmbeddingService)
-    - app.models.query (RetrievedContext, ScoredChunk)
-    - app.config (RetrievalSettings)
+    - k=3: Simple factual lookups. Minimal context, fast, may miss evidence.
+    - k=5: Default. 5 × 512 = ~2560 tokens; fits in 4K context budget.
+    - k=7-10: Complex analytical questions requiring multi-section synthesis.
+    - Configurable per-query via the API's top_k parameter (range 3-10).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Dependencies
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    app.db.vector_store          (VectorStore interface)
+    app.models.query             (ScoredChunk)
+    app.schemas.metadata         (RetrievalMetadata)
+    app.exceptions               (StorageReadError, NoDocumentsError)
+    app.config                   (RetrievalSettings)
 """

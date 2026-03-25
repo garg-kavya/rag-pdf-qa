@@ -1,79 +1,127 @@
 """
-RAG Orchestration Chain
-========================
+RAG Chain — LLM Interaction Layer
+===================================
 
 Purpose:
-    The central orchestrator that wires together all RAG pipeline stages
-    into a single callable chain. This is the entry point that API handlers
-    invoke to process a user query end-to-end.
+    Defines the LangChain/LangGraph chain responsible ONLY for LLM interaction:
+    prompt assembly, OpenAI Chat API call, token streaming, and citation
+    extraction from the raw LLM output.
 
-Execution Flow:
+    This module is NOT the pipeline orchestrator. It does not know about
+    caches, the reranker, session management, or memory compression.
+    Those concerns live in app/pipeline/rag_pipeline.py.
 
-    1. Session Resolution
-       - Load session from SessionStore
-       - Validate session exists and has documents
-       - Extract conversation history and document_ids
+    Calling convention (established by RAGPipeline):
+        RAGPipeline prepares a fully-populated QueryContext and
+        RetrievedContext, then hands them to RAGChain.invoke() or
+        RAGChain.stream(). The chain's only job is to turn those inputs
+        into a GeneratedAnswer.
 
-    2. Query Reformulation (conditional)
-       - If conversation_history is non-empty:
-         Call QueryReformulator to produce standalone_query
-       - If first turn: standalone_query = raw_query
-       - Latency: 0ms (first turn) or 200-400ms (follow-up)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Responsibilities of THIS module
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    3. Query Embedding
-       - Call EmbeddingService.embed_query(standalone_query)
-       - Produces 1536-dim vector
-       - Latency: ~100-150ms
+    1. Prompt Assembly
+       - Build the full prompt from templates in app/chains/prompts.py:
+           system_prompt
+           + numbered context block (from retrieved chunks)
+           + conversation history block (from query_context.formatted_history)
+           + user question (standalone_query)
+       - Apply context-window budget: if total tokens exceed LLM_MAX_CONTEXT,
+         drop the lowest-scored chunks (not the history — history is already
+         budgeted by MemoryManager).
 
-    4. Retrieval
-       - Call RetrieverService.retrieve() with embedding and document_ids
-       - 3-stage pipeline: vector search -> threshold filter -> MMR re-rank
-       - Returns top-k scored chunks
-       - Latency: ~50-150ms
+    2. LLM Call
+       - Call OpenAI Chat Completion (non-streaming) or streaming API.
+       - Temperature and max_tokens from OpenAISettings.
+       - On timeout: retry once with same payload.
+       - On non-retryable error: raise GenerationAPIError.
 
-    5. Generation
-       - Call GeneratorService.generate() or generate_stream()
-       - Passes reformulated query + retrieved chunks + conversation history
-       - Returns answer with citations
-       - Latency: ~500-1500ms (non-streaming) or ~300-500ms to first token
+    3. Citation Extraction (post-generation)
+       - Parse [Source N] references in the generated text.
+       - Map each reference to the corresponding ScoredChunk metadata.
+       - Build structured Citation objects.
+       - Validate: discard references to source numbers not in the context
+         (hallucination guard — the LLM cited a source it wasn't given).
+       - On CitationExtractionError: log warning, return empty citations
+         rather than failing the request.
 
-    6. Session Update
-       - Append new ConversationTurn to session history
-       - Update last_active_at timestamp
+    4. Confidence Scoring
+       - Heuristic: mean(similarity_score) × citation_density_factor
+         × uncertainty_penalty (if LLM output contains "I don't know" etc.)
 
-    Total Latency Budget:
-       Reformulation:  200-400ms (follow-up) or 0ms (first turn)
-       Embedding:      100-150ms
-       Retrieval:       50-150ms
-       Generation:     300-500ms (first token, streaming)
-       ────────────────────────────
-       Total to first token: 650-1200ms (well under 2s target)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NOT Responsibilities of THIS module
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-LangChain/LangGraph Integration:
-    This chain can be implemented as:
-    - A LangChain LCEL (LangChain Expression Language) chain
-    - A LangGraph stateful graph with nodes for each stage
-    - LangGraph is preferred for the conditional reformulation logic
-      and built-in streaming support
+    ✗ Session lookup / validation           → RAGPipeline
+    ✗ Query reformulation                   → QueryReformulator (via RAGPipeline)
+    ✗ Query embedding                       → EmbeddingCache (via RAGPipeline)
+    ✗ Vector search / retrieval             → RetrieverService (via RAGPipeline)
+    ✗ Reranking                             → RerankerService (via RAGPipeline)
+    ✗ MMR selection                         → RetrieverService (via RAGPipeline)
+    ✗ Reading conversation history          → MemoryManager (via RAGPipeline)
+    ✗ Writing conversation history          → MemoryManager (via RAGPipeline)
+    ✗ Response caching                      → ResponseCache (via RAGPipeline)
+    ✗ SSE formatting / StreamingResponse    → StreamingHandler (via RAGPipeline)
 
-Methods:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LangGraph Implementation Note
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    invoke(query: str, session_id: str, **kwargs) -> GeneratedAnswer:
-        Synchronous execution of the full pipeline.
-        Inputs: raw query string + session ID
-        Outputs: GeneratedAnswer with text, citations, confidence
+    The chain is implemented as a LangGraph StateGraph with two nodes:
+        "assemble_prompt"  → builds ChatPromptTemplate messages
+        "call_llm"         → invokes the model, extracts citations
 
-    stream(query: str, session_id: str, **kwargs) -> AsyncGenerator:
-        Streaming execution — retrieval is synchronous, generation streams.
-        Inputs: same as invoke()
-        Outputs: async generator of SSE events
+    LangGraph is used here (not LCEL) for:
+    - Built-in streaming support without boilerplate
+    - Conditional edge for context truncation
+    - Typed state (ChainState dataclass) flowing between nodes
 
-Dependencies:
-    - langchain / langgraph
-    - app.services.query_reformulator
-    - app.services.embedder
-    - app.services.retriever
-    - app.services.generator
-    - app.db.session_store
-    - app.models.query (QueryContext, RetrievedContext, GeneratedAnswer)
+    ChainState:
+        query_context: QueryContext
+        retrieved_context: RetrievedContext
+        prompt_messages: list[ChatMessage] | None  (populated by assemble_prompt)
+        raw_llm_output: str | None                 (populated by call_llm)
+        generated_answer: GeneratedAnswer | None   (populated by call_llm)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Methods
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    invoke(
+        query_context: QueryContext,
+        retrieved_context: RetrievedContext
+    ) -> GeneratedAnswer:
+        Synchronous (non-streaming) chain execution.
+        Inputs:
+            query_context    — fully populated by RAGPipeline (all fields set)
+            retrieved_context — ranked chunks from retriever + reranker + MMR
+        Outputs:
+            GeneratedAnswer (answer_text, citations, confidence)
+            Does NOT set query_id, cache_hit, or pipeline_metadata —
+            those are set by RAGPipeline before returning to the API.
+
+    stream(
+        query_context: QueryContext,
+        retrieved_context: RetrievedContext
+    ) -> AsyncGenerator[StreamingChunk, None]:
+        Streaming chain execution via LangGraph.stream().
+        Yields StreamingChunk events (event="token" per token).
+        Does NOT yield citation or done events — RAGPipeline wraps this
+        generator and appends those final events.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Dependencies
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    langchain / langgraph
+    openai (AsyncOpenAI)
+    app.chains.prompts     (SYSTEM_PROMPT, CONTEXT_TEMPLATE, etc.)
+    app.models.query       (QueryContext, RetrievedContext, GeneratedAnswer,
+                            Citation, StreamingChunk)
+    app.exceptions         (GenerationAPIError, GenerationTimeoutError,
+                            ContextTooLongError, CitationExtractionError)
+    app.config             (OpenAISettings)
+    app.utils.token_counter (count_tokens — for context window budget)
 """

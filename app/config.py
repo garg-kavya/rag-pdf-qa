@@ -42,9 +42,47 @@ Configuration Sections:
     RetrievalSettings:
         - VECTOR_STORE_TYPE: str = "faiss"  # "faiss" | "chroma"
         - TOP_K: int = 5
-        - TOP_K_CANDIDATES: int = 10  # retrieve 2x for re-ranking
+            Final number of chunks passed to the LLM after MMR selection.
+        - TOP_K_CANDIDATES: int = 10
+            Over-fetch factor: 2x top_k fetched before reranking/MMR.
+            Provides enough candidates for the reranker to meaningfully
+            reorder before MMR trims to final top_k.
         - SIMILARITY_THRESHOLD: float = 0.70
         - MMR_DIVERSITY_FACTOR: float = 0.3
+            λ in MMR formula: higher = more relevance weight, less diversity.
+
+    RerankerSettings:
+        - RERANKER_BACKEND: str = "none"
+            One of: "none" | "cross_encoder" | "cohere"
+            "none"          → disabled; MMR-only ordering.
+            "cross_encoder" → local sentence-transformers model; no API cost.
+            "cohere"        → Cohere Rerank API; higher quality, external call.
+        - COHERE_API_KEY: str | None = None
+            Required when RERANKER_BACKEND == "cohere". Loaded as a secret.
+        - CROSS_ENCODER_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+            Sentence-transformers model name for local cross-encoder reranking.
+            ~70MB download on first use. Cached locally by sentence-transformers.
+
+    CacheSettings:
+        - CACHE_BACKEND: str = "memory"
+            Currently only "memory" is supported. Future: "redis".
+        - CACHE_MAX_SIZE: int = 1000
+            Max entries in the LRU in-memory cache before eviction.
+        - EMBEDDING_CACHE_TTL_SECONDS: int = 86400
+            24 hours. Embeddings are deterministic for a given model version.
+        - RESPONSE_CACHE_TTL_SECONDS: int = 60
+            60 seconds. Prevents double-submission; short because history changes.
+
+    MemorySettings:
+        - MEMORY_TOKEN_BUDGET: int = 1024
+            Max tokens allocated to conversation history in each prompt.
+            ContextBuilder trims oldest turns to stay within this budget.
+        - COMPRESSION_THRESHOLD: int = 10
+            Number of turns at which MemoryCompressor is triggered.
+            Equals MAX_CONVERSATION_TURNS by default so compression fires
+            before any turns are dropped.
+        - COMPRESSION_TURNS: int = 5
+            Number of oldest turns to compress into a summary at once.
 
     SessionSettings:
         - SESSION_TTL_MINUTES: int = 60

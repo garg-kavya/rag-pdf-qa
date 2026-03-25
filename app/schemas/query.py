@@ -9,52 +9,82 @@ Purpose:
 Schemas:
 
     QueryRequest:
-        The user's question along with session context.
+        The user's question and configuration overrides.
         Fields:
-            question: str - the user's natural language question (required, min 1 char)
-            session_id: str - UUID of the active session (required)
-            document_ids: list[str] | None - optional filter to specific documents;
-                if None, queries all documents in the session
-            top_k: int | None - override default top-k retrieval count (3-10)
-            stream: bool = False - whether to use SSE streaming
+            question: str       — required; 1-2000 characters
+            session_id: str     — required; valid UUID of an active session
+            document_ids: list[str] | None
+                Optional override to scope retrieval to specific documents.
+                If None, retrieval is scoped to all documents in the session.
+            top_k: int | None   — optional; override retrieval top-k (range 3-10)
+            stream: bool = False — ignored on /query; always True on /query/stream
+
+    PipelineMetadataSchema:
+        End-to-end timing and model diagnostics for the API response.
+        Mirrors PipelineMetadata domain model for serialisation.
+        Fields:
+            total_time_ms: float
+            reformulation_time_ms: float
+            embedding_time_ms: float
+            retrieval_time_ms: float
+            reranking_time_ms: float
+            generation_time_ms: float
+            embedding_cache_hit: bool
+            response_cache_hit: bool
+            reranker_backend: str   — "cohere" | "cross_encoder" | "none"
+            llm_model: str
+            embedding_model: str
 
     CitationSchema:
         A single source reference in the response.
         Fields:
-            document_name: str - original PDF filename
-            page_numbers: list[int] - pages where cited info appears
-            chunk_index: int - chunk position in the document
-            chunk_id: str - unique chunk identifier
-            excerpt: str - short supporting excerpt from the source chunk
+            document_name: str
+            page_numbers: list[int]
+            chunk_index: int
+            chunk_id: str
+            excerpt: str    — ≤200 characters
+
+    RetrievalMetadataSchema:
+        Diagnostics from the retrieval + reranking stages.
+        Mirrors the typed RetrievalMetadata from app.schemas.metadata.
+        Fields:
+            retrieval_time_ms: float
+            candidates_considered: int
+            candidates_after_threshold: int
+            chunks_used: int
+            mmr_applied: bool
+            reranker_applied: bool
+            reranker_backend: str
+            similarity_scores: list[float]
+            top_k_requested: int
+            similarity_threshold_used: float
 
     QueryResponse:
-        The full answer returned for a non-streaming query.
+        Full response for a synchronous (non-streaming) query.
         Fields:
-            answer: str - the generated answer grounded in document content
-            citations: list[CitationSchema] - source references
-            session_id: str - the session this answer belongs to
-            query_id: str - unique ID for this query (for logging/debugging)
-            confidence: float - heuristic confidence score (0.0-1.0)
-            retrieval_metadata: dict - diagnostics:
-                - retrieval_time_ms: float
-                - chunks_considered: int
-                - chunks_used: int
-                - similarity_scores: list[float]
+            answer: str             — the generated answer text
+            citations: list[CitationSchema]
+            session_id: str
+            query_id: str           — UUID for request tracing
+            confidence: float       — 0.0 to 1.0 heuristic score
+            cache_hit: bool         — True if served from ResponseCache
+            retrieval_metadata: RetrievalMetadataSchema
+            pipeline_metadata: PipelineMetadataSchema
 
-    StreamingChunk:
-        A single SSE event in the streaming response.
+    StreamingChunkSchema:
+        A single SSE event payload.
         Fields:
-            event: str - "token" | "citation" | "done" | "error"
-            data: str - token text, JSON citation, completion signal, or error message
+            event: str      — "token" | "citation" | "done" | "error"
+            data: str       — JSON payload string for the event
             query_id: str
 
 Validation Rules:
-    - question must be non-empty and <= 2000 characters
-    - session_id must be a valid UUID
-    - top_k must be between 3 and 10 if provided
-    - document_ids, if provided, must all be valid UUIDs
+    - question: min_length=1, max_length=2000
+    - session_id: must be a valid UUID4 string
+    - top_k: ge=3, le=10 (when provided)
+    - document_ids: each element must be a valid UUID4 string
 
 Dependencies:
-    - pydantic (BaseModel, Field, validator)
+    - pydantic (BaseModel, Field, field_validator)
     - uuid
 """

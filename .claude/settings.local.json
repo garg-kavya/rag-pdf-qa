@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(ls:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(find \"/c/Users/kavya/Desktop/RAG-PDF Q&A\" -not -path '*/.git/*' -not -path '*/.claude/*' -name \"*.py\")"
     ]
   }
 }

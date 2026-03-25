@@ -6,10 +6,20 @@ Purpose:
     Handles user questions against uploaded PDF documents. Supports both
     synchronous (full response) and streaming (SSE) modes.
 
+    API handlers here are intentionally thin — all business logic is
+    delegated to RAGPipeline. The handler's only jobs are:
+        1. Validate the incoming request (Pydantic schema validation)
+        2. Call the appropriate RAGPipeline method
+        3. Map the result to an API response schema
+
+    Calling convention:
+        POST /query      → RAGPipeline.run()         → QueryResponse
+        POST /query/stream → RAGPipeline.run_stream() → StreamingResponse (SSE)
+
 Endpoints:
 
     POST /api/v1/query
-        Ask a question and receive a complete answer with citations.
+        Ask a question; receive a complete answer with citations.
 
         Request Body (JSON):
             {
@@ -20,15 +30,11 @@ Endpoints:
                 "stream": false         # must be false for this endpoint
             }
 
-        Processing Flow:
-            1. Validate session exists
-            2. Reformulate query (if follow-up)
-            3. Embed reformulated query
-            4. Retrieve top-k relevant chunks (with MMR re-ranking)
-            5. Generate answer with citation-aware prompt
-            6. Extract and validate citations
-            7. Update session history
-            8. Return complete response
+        Handler steps:
+            1. Validate QueryRequest (Pydantic)
+            2. Call RAGPipeline.run(question, session_id, document_ids, top_k)
+            3. Map GeneratedAnswer → QueryResponse schema
+            4. Return 200 OK
 
         Response: 200 OK
             {
@@ -45,48 +51,86 @@ Endpoints:
                 "session_id": str,
                 "query_id": str,
                 "confidence": float,
+                "cache_hit": bool,
                 "retrieval_metadata": {
                     "retrieval_time_ms": float,
-                    "chunks_considered": int,
+                    "candidates_considered": int,
+                    "candidates_after_threshold": int,
                     "chunks_used": int,
-                    "similarity_scores": [float]
+                    "mmr_applied": bool,
+                    "reranker_applied": bool,
+                    "reranker_backend": str,
+                    "similarity_scores": [float],
+                    "top_k_requested": int,
+                    "similarity_threshold_used": float
+                },
+                "pipeline_metadata": {
+                    "total_time_ms": float,
+                    "reformulation_time_ms": float,
+                    "embedding_time_ms": float,
+                    "retrieval_time_ms": float,
+                    "reranking_time_ms": float,
+                    "generation_time_ms": float,
+                    "embedding_cache_hit": bool,
+                    "response_cache_hit": bool,
+                    "llm_model": str
                 }
             }
 
         Errors:
-            400 — Invalid request (empty question, bad UUID, etc.)
-            404 — Session not found
-            404 — No documents in session
-            500 — Generation failure
+            400 — Invalid request (empty question, bad UUID, top_k out of range)
+            404 — Session not found or expired
+            409 — Session has no documents (NoDocumentsError)
+            422 — Document not ready (still processing)
+            502 — OpenAI API failure
+            504 — OpenAI API timeout
 
     POST /api/v1/query/stream
-        Ask a question and receive a streaming SSE response.
+        Ask a question; receive a streaming SSE response.
 
-        Request Body: Same as POST /api/v1/query (stream field ignored)
+        Request Body: Same as POST /api/v1/query.
+
+        Handler steps:
+            1. Validate QueryRequest (Pydantic)
+            2. Call RAGPipeline.run_stream(question, session_id, document_ids, top_k)
+            3. Wrap async generator in StreamingHandler.create_stream_response()
+            4. Return StreamingResponse (text/event-stream)
 
         Response: 200 OK
             Content-Type: text/event-stream
             Cache-Control: no-cache
             Connection: keep-alive
+            X-Query-Id: {query_id}
 
             SSE Events (in order):
                 event: token
                 data: {"text": "...", "query_id": "..."}
-                ... (repeated for each token)
+                ... (one per generated token)
 
                 event: citation
                 data: {"citations": [...], "query_id": "..."}
 
                 event: done
-                data: {"query_id": "...", "total_tokens": int}
+                data: {
+                    "query_id": "...",
+                    "total_tokens": int,
+                    "retrieval_time_ms": float,
+                    "reranker_applied": bool,
+                    "confidence": float
+                }
 
-        Errors: Same as non-streaming, but sent as SSE error events
+                event: error  (only on failure)
+                data: {"message": "...", "query_id": "..."}
+
+        Errors: Sent as SSE error events rather than HTTP error codes,
+                because headers are already committed when streaming starts.
 
 Dependencies:
     - fastapi (APIRouter, Depends, HTTPException)
     - fastapi.responses (StreamingResponse)
-    - app.schemas.query (QueryRequest, QueryResponse, StreamingChunk)
-    - app.dependencies (get_rag_chain, get_session_store)
-    - app.chains.rag_chain (RAGChain)
+    - app.schemas.query (QueryRequest, QueryResponse)
+    - app.dependencies (get_rag_pipeline)
+    - app.pipeline.rag_pipeline (RAGPipeline)
     - app.services.streaming (StreamingHandler)
+    - app.exceptions (SessionNotFoundError, NoDocumentsError, ...)
 """

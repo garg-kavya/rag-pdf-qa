@@ -2,181 +2,187 @@
 
 ## Overview
 
-This system is a **production-grade Retrieval-Augmented Generation (RAG) pipeline** purpose-built for answering questions over uploaded PDF documents with conversational memory and source citations.
+A production-grade Retrieval-Augmented Generation system for answering questions over uploaded PDF documents with conversational memory, source citations, and low-latency streaming.
 
-It is **not** a generic chatbot. Every component is designed around the constraint that answers must be grounded exclusively in the content of uploaded PDFs.
+Every answer is grounded exclusively in uploaded PDF content. No prior knowledge leaks from the LLM.
 
 ---
 
-## High-Level Architecture
+## Layer Model
 
 ```
+┌───────────────────────────────────────────────────────────────────┐
+│                         CLIENT                                    │
+│        PDF Upload                     Question                    │
+└───────────────┬───────────────────────────────┬───────────────────┘
+                │                               │
+                ▼                               ▼
+┌───────────────────────────────────────────────────────────────────┐
+│                      API LAYER  (app/api/)                        │
+│  /documents/upload          /query          /query/stream         │
+│  /sessions                  /health                               │
+│  Thin handlers: validate → delegate → map response                │
+└───────────────┬───────────────────────────────┬───────────────────┘
+                │                               │
+                ▼                               ▼
+┌─────────────────────────┐   ┌─────────────────────────────────────┐
+│  INGESTION PIPELINE     │   │  RAG PIPELINE  (app/pipeline/)      │
+│  (app/pipeline/)        │   │                                     │
+│                         │   │  Single entry point for all         │
+│  Orchestrates:          │   │  query-answer operations.           │
+│  PDF parse → clean      │   │  Orchestrates: cache check →        │
+│  → chunk → embed        │   │  reformulate → embed (cached) →     │
+│  → vector store         │   │  retrieve → rerank → MMR →          │
+│  → registry update      │   │  memory read → generate (cached) → │
+│                         │   │  memory write                       │
+└─────────────────────────┘   └─────────────────────────────────────┘
+                │                               │
+                └───────────────┬───────────────┘
+                                │ calls
+          ┌─────────────────────┼──────────────────────────┐
+          │                     │                          │
+          ▼                     ▼                          ▼
+┌──────────────────┐  ┌─────────────────────┐  ┌──────────────────┐
+│  SERVICES        │  │  CACHE LAYER        │  │  MEMORY LAYER    │
+│  (app/services/) │  │  (app/cache/)       │  │  (app/memory/)   │
+│                  │  │                     │  │                  │
+│  pdf_processor   │  │  EmbeddingCache     │  │  MemoryManager   │
+│  text_cleaner    │  │    sha256(query)    │  │    orchestrates  │
+│  chunker         │  │    → 24h TTL        │  │                  │
+│  embedder        │  │                     │  │  ContextBuilder  │
+│  retriever       │  │  ResponseCache      │  │    token-budgets │
+│  reranker        │  │    (session,query,  │  │    history       │
+│  generator       │  │     docs, turns)    │  │                  │
+│  query_reformulator  │    → 60s TTL       │  │  MemoryCompressor│
+│  streaming       │  │                     │  │    summarises    │
+└──────────────────┘  └─────────────────────┘  │    old turns     │
+          │                     │               └──────────────────┘
+          │                     │
+          ▼                     ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│                         CLIENT (Browser / API)                   │
-│                                                                  │
-│   Upload PDF ──────┐                    Ask Question ─────┐      │
-│                    │                                      │      │
-└────────────────────┼──────────────────────────────────────┼──────┘
-                     │                                      │
-                     ▼                                      ▼
-┌──────────────────────────────┐   ┌───────────────────────────────┐
-│     INGESTION PIPELINE       │   │       QUERY PIPELINE          │
-│                              │   │                               │
-│  ┌────────────────────────┐  │   │  ┌─────────────────────────┐  │
-│  │   1. PDF Processor     │  │   │  │  1. Query Reformulator  │  │
-│  │   (PyMuPDF/pdfplumber) │  │   │  │  (resolve follow-ups)   │  │
-│  └──────────┬─────────────┘  │   │  └──────────┬──────────────┘  │
-│             ▼                │   │             ▼                  │
-│  ┌────────────────────────┐  │   │  ┌─────────────────────────┐  │
-│  │   2. Text Cleaner      │  │   │  │  2. Embedder            │  │
-│  │   (normalize/clean)    │  │   │  │  (query -> vector)      │  │
-│  └──────────┬─────────────┘  │   │  └──────────┬──────────────┘  │
-│             ▼                │   │             ▼                  │
-│  ┌────────────────────────┐  │   │  ┌─────────────────────────┐  │
-│  │   3. Chunker           │  │   │  │  3. Retriever           │  │
-│  │   (512 tokens, overlap)│  │   │  │  (search + MMR rerank)  │  │
-│  └──────────┬─────────────┘  │   │  └──────────┬──────────────┘  │
-│             ▼                │   │             ▼                  │
-│  ┌────────────────────────┐  │   │  ┌─────────────────────────┐  │
-│  │   4. Embedder          │  │   │  │  4. Generator           │  │
-│  │   (batch embed chunks) │  │   │  │  (LLM + citations)      │  │
-│  └──────────┬─────────────┘  │   │  └──────────┬──────────────┘  │
-│             ▼                │   │             ▼                  │
-│  ┌────────────────────────┐  │   │  ┌─────────────────────────┐  │
-│  │   5. Vector Store      │  │   │  │  5. Streaming Handler   │  │
-│  │   (FAISS / ChromaDB)   │  │   │  │  (SSE token delivery)   │  │
-│  └────────────────────────┘  │   │  └─────────────────────────┘  │
-│                              │   │                               │
-└──────────────────────────────┘   └───────────────────────────────┘
-                     │                          │
-                     ▼                          ▼
-          ┌──────────────────────────────────────────┐
-          │             SHARED STATE                  │
-          │                                          │
-          │  ┌────────────┐   ┌───────────────────┐  │
-          │  │ Vector DB  │   │  Session Store    │  │
-          │  │ (FAISS/    │   │  (in-memory,      │  │
-          │  │  ChromaDB) │   │   TTL-expiring)   │  │
-          │  └────────────┘   └───────────────────┘  │
-          └──────────────────────────────────────────┘
+│  CHAINS LAYER  (app/chains/)                                     │
+│  LLM-specific only: prompt assembly, OpenAI call, citation parse │
+│  RAGChain (LangGraph) — called by RAGPipeline only               │
+└──────────────────────────────────────────────────────────────────┘
+          │                     │
+          ▼                     ▼
+┌─────────────────┐   ┌──────────────────────────────────────────┐
+│  DB / STORAGE   │   │  DOMAIN MODELS + SCHEMAS                 │
+│  (app/db/)      │   │  (app/models/, app/schemas/)             │
+│                 │   │                                          │
+│  VectorStore    │   │  QueryContext, ScoredChunk,              │
+│  FAISSStore     │   │  GeneratedAnswer, PipelineMetadata       │
+│  ChromaStore    │   │  ChunkMetadata, RetrievalMetadata        │
+│  SessionStore   │   │  (typed, validated, single source of     │
+│  DocumentReg.   │   │   truth for all data shapes)             │
+└─────────────────┘   └──────────────────────────────────────────┘
 ```
 
 ---
 
-## Component Breakdown
+## Component Reference
 
-### 1. API Layer (`app/api/`)
+### API Layer (`app/api/`)
 
-**Framework:** FastAPI (async, OpenAPI docs, dependency injection)
-
-| Endpoint | Method | Purpose |
+| Endpoint | Handler | Delegates to |
 |---|---|---|
-| `/api/v1/documents/upload` | POST | Upload and ingest a PDF |
-| `/api/v1/documents/{id}` | GET | Check document processing status |
-| `/api/v1/documents/{id}` | DELETE | Remove document and its vectors |
-| `/api/v1/query` | POST | Ask a question (full response) |
-| `/api/v1/query/stream` | POST | Ask a question (SSE streaming) |
-| `/api/v1/sessions` | POST | Create a conversation session |
-| `/api/v1/sessions/{id}` | GET | Get session details + history |
-| `/api/v1/sessions/{id}` | DELETE | End a session |
-| `/api/v1/health` | GET | Service health check |
+| `POST /documents/upload` | `documents.py` | `IngestionPipeline.run()` (BackgroundTask) |
+| `GET /documents/{id}` | `documents.py` | `DocumentRegistry.get()` |
+| `DELETE /documents/{id}` | `documents.py` | `VectorStore.delete_document()` + `DocumentRegistry.delete()` |
+| `POST /query` | `query.py` | `RAGPipeline.run()` |
+| `POST /query/stream` | `query.py` | `RAGPipeline.run_stream()` |
+| `POST /sessions` | `sessions.py` | `SessionStore.create_session()` |
+| `GET /sessions/{id}` | `sessions.py` | `SessionStore.get_session()` |
+| `DELETE /sessions/{id}` | `sessions.py` | `SessionStore.delete_session()` |
+| `GET /health` | `health.py` | VectorStore + OpenAI + DocumentRegistry stats |
 
-**Middleware:**
-- Rate limiting (token bucket per client IP)
-- Global error handler (structured JSON error responses)
-- CORS (configurable origins)
+### Pipeline Layer (`app/pipeline/`)
 
-### 2. PDF Processing Pipeline (`app/services/pdf_processor.py`, `text_cleaner.py`, `chunker.py`)
+**`rag_pipeline.py`** — the single orchestrator for all query operations. No service, cache, or memory module is called by the API or by other services — only by this pipeline.
 
-**Parser:** Dual-engine with automatic fallback
-- **Primary:** PyMuPDF (fitz) — ~100 pages/sec, handles most PDFs
-- **Fallback:** pdfplumber — better for tables and complex layouts
-- **Quality gate:** If both yield insufficient text, report error (scanned PDF)
+**`ingestion_pipeline.py`** — the single orchestrator for all PDF ingestion. Called as a FastAPI `BackgroundTask` after the API handler returns 202.
 
-**Cleaner:** 6-stage text normalization
-- Unicode NFKC normalization
-- Whitespace consolidation
-- Hyphenated line-break rejoining
-- Header/footer detection and removal
-- Control character stripping
-- Empty line consolidation
+### Services Layer (`app/services/`)
 
-**Chunker:** Recursive character splitting
-- **Size:** 512 tokens (configurable 256-1024)
-- **Overlap:** 64 tokens (12.5%)
-- **Hierarchy:** paragraphs → lines → sentences → words
-- **Metadata:** page numbers, character offsets, token counts
+Each service has a single responsibility and knows nothing about caches, memory, or the pipeline order.
 
-### 3. Embedding Layer (`app/services/embedder.py`)
+| Service | Responsibility |
+|---|---|
+| `pdf_processor` | Parse PDF (PyMuPDF → pdfplumber fallback) |
+| `text_cleaner` | Normalize extracted text (6 operations) |
+| `chunker` | Split text into 512-token chunks with overlap |
+| `embedder` | Batch embed chunks via OpenAI API |
+| `retriever` | Vector search + threshold filter + MMR selection |
+| `reranker` | Cross-encoder second-pass relevance scoring (optional) |
+| `generator` | (moved to chains layer — see below) |
+| `query_reformulator` | Resolve follow-up queries into standalone questions |
+| `streaming` | Format SSE events from async token generator |
 
-- **Model:** OpenAI `text-embedding-3-small` (1536 dimensions)
-- **Ingestion:** Batch embedding (100 chunks/call) with async concurrency
-- **Query:** Single embedding call (~100-150ms)
-- **Error handling:** Exponential backoff on rate limits
+### Chains Layer (`app/chains/`)
 
-### 4. Vector Storage (`app/db/`)
+Narrowed to LLM-only concerns. Called exclusively by `RAGPipeline`.
 
-**Abstract interface** (`vector_store.py`) with two implementations:
+| Module | Responsibility |
+|---|---|
+| `rag_chain.py` | Build prompt, call OpenAI, extract citations, score confidence |
+| `prompts.py` | All prompt templates (system, context, history, reformulation) |
 
-| Feature | FAISS | ChromaDB |
-|---|---|---|
-| Search latency | ~10-50ms | ~50-100ms |
-| Metadata filtering | Post-filter (over-fetch) | Native WHERE clause |
-| Persistence | Manual save/load | Automatic |
-| Best for | Performance-critical prod | Rapid development |
+### Cache Layer (`app/cache/`)
 
-**Metadata per vector:** chunk_id, document_id, document_name, chunk_index, page_numbers, token_count, text
+| Module | What is cached | Key | TTL |
+|---|---|---|---|
+| `embedding_cache` | Query embeddings | sha256(normalised query) | 24h |
+| `response_cache` | Full `GeneratedAnswer` | sha256(session+query+docs+turns) | 60s |
+| `in_memory_cache` | Backend (LRU dict) | — | configurable |
+| `cache_backend` | Abstract interface | — | — |
 
-### 5. Retrieval System (`app/services/retriever.py`)
+### Memory Layer (`app/memory/`)
 
-3-stage retrieval pipeline:
-1. **Vector search:** Cosine similarity, top-k×2 candidates
-2. **Score threshold:** Discard chunks below 0.70 similarity
-3. **MMR re-ranking:** Balance relevance with diversity (λ=0.7)
+| Module | Responsibility |
+|---|---|
+| `memory_manager` | Orchestrates memory read (pre-generation) and write (post-generation) |
+| `context_builder` | Serialises `ConversationTurn` list into token-budgeted history string |
+| `memory_compressor` | Summarises oldest N turns when session exceeds threshold |
 
-### 6. Answer Generation (`app/services/generator.py`)
+### DB / Storage Layer (`app/db/`)
 
-- **Model:** GPT-4o (temperature=0.1)
-- **Prompt:** System instruction enforcing context-only answers with [Source N] citations
-- **Citation extraction:** Post-processing parses source references and maps to chunk metadata
-- **Confidence scoring:** Heuristic based on retrieval scores and citation density
-
-### 7. Conversational Memory (`app/db/session_store.py`)
-
-- **Storage:** In-memory dict with TTL-based expiry (default 60 min)
-- **History:** Last 10 turns per session (configurable)
-- **Follow-ups:** Query reformulation via LLM resolves pronouns and references
-- **Cleanup:** Background task purges expired sessions every 5 minutes
-
-### 8. Streaming (`app/services/streaming.py`)
-
-- **Protocol:** Server-Sent Events (SSE)
-- **Flow:** Retrieval completes first (blocking), then generation streams token-by-token
-- **Events:** `token` → `citation` → `done` (or `error`)
-- **Cancellation:** Client disconnect stops generation (saves API cost)
+| Module | Responsibility |
+|---|---|
+| `vector_store` | Abstract interface: add_chunks, search, delete_document |
+| `faiss_store` | FAISS IndexFlatIP + parallel metadata dict |
+| `chroma_store` | ChromaDB persistent collection |
+| `session_store` | In-memory session CRUD with TTL expiry |
+| `document_registry` | In-memory document status and metadata tracking |
 
 ---
 
-## Design Decisions
+## Key Design Decisions
 
-### Why 512-token chunks?
-See `docs/retrieval_strategy.md` for the full analysis. In short: 512 balances precision (small enough for focused relevance) with context (large enough for coherent ideas). 5 chunks × 512 tokens = 2560 tokens, fitting in a 4K context budget.
+### 1. Pipeline Layer Separates Orchestration from Services
+`RAGPipeline` owns the stage order and wiring. Services, caches, and memory modules are independent — none call each other directly. This makes each unit testable in isolation and the pipeline swappable.
 
-### Why in-memory session storage?
-Sessions are ephemeral (1-hour TTL), small (10 turns), and accessed in the hot path. In-memory provides sub-millisecond reads. For horizontal scaling, swap to Redis via the same SessionStore interface.
+### 2. Chains Layer is LLM-Only
+`rag_chain.py` does not know about sessions, caches, reranking, or memory. It receives a fully-populated `QueryContext` and `RetrievedContext` and returns a `GeneratedAnswer`. This makes it easy to swap LangGraph for a different framework.
 
-### Why FAISS + ChromaDB abstraction?
-FAISS is fastest for production but lacks native metadata filtering. ChromaDB is simpler for development. The abstraction layer lets teams choose per-environment.
+### 3. Reranker is Optional and Graceful
+`is_enabled()` guards the reranking step. When disabled, the pipeline is identical to the pre-reranker design (MMR-only). When the reranker fails, it logs a warning and falls back to bi-encoder ordering — the request never fails due to a reranker error.
 
-### Why dual PDF parsers?
-No single parser handles all PDF variants well. PyMuPDF is fast but struggles with complex layouts. pdfplumber handles edge cases but is slower. The fallback strategy gets the best of both.
+### 4. Two-Level Caching
+- **Embedding cache** (24h): eliminates the most common bottleneck (repeated queries).
+- **Response cache** (60s): eliminates double-submission LLM calls; includes `turn_count` in the key to prevent stale answers.
+
+### 5. Memory Layer Above Storage Layer
+`session_store` handles persistence (CRUD, TTL). `memory_manager` handles intelligence (what to keep, how to format it, when to compress). Keeping them separate means the storage layer is replaceable (e.g., Redis) without touching memory logic.
+
+### 6. DocumentRegistry Separates Document State from Vectors
+Document status, PDF metadata, and ingestion results are stored in `DocumentRegistry`. Chunk vectors are stored in `VectorStore`. Neither knows about the other; `IngestionPipeline` coordinates them.
 
 ---
 
 ## Scalability Path
 
-| Scale | Storage | Sessions | Deployment |
+| Scale | Vector Store | Sessions | Deployment |
 |---|---|---|---|
-| Dev/POC | FAISS (in-memory) | In-memory dict | Single container |
-| Small prod | ChromaDB (persistent) | Redis | Docker Compose |
-| Large prod | Pinecone/Weaviate | Redis Cluster | Kubernetes |
+| Dev | FAISS (in-memory) | In-memory dict | Single container |
+| Small prod | ChromaDB (persistent) | In-memory + Redis eviction | Docker Compose |
+| Large prod | Pinecone / Weaviate | Redis Cluster | Kubernetes |

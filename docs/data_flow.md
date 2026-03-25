@@ -1,298 +1,228 @@
 # Data Flow — RAG PDF Q&A System
 
-This document traces the complete data path through the system for both primary operations: **PDF ingestion** and **question answering**.
-
 ---
 
 ## Flow 1: PDF Ingestion
 
 ```
-User uploads PDF
-       │
-       ▼
+Client: POST /api/v1/documents/upload (multipart/form-data)
+              │
+              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ POST /api/v1/documents/upload                                   │
-│ Content-Type: multipart/form-data                               │
-│ Body: file=<PDF bytes>, session_id=<optional UUID>              │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
+│ API Handler (documents.py)                                      │
+│ 1. Validate MIME = application/pdf                              │
+│ 2. Validate size ≤ MAX_UPLOAD_SIZE_MB                           │
+│ 3. FileUtils.save_upload() → (file_path, document_id)          │
+│ 4. DocumentRegistry.register(document_id, ...) → status=uploaded│
+│ 5. Launch IngestionPipeline.run() as BackgroundTask             │
+│ 6. Return 202 Accepted immediately                              │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │ (background)
+                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ Step 1: FILE VALIDATION & STORAGE                               │
+│ IngestionPipeline.run()                                         │
 │                                                                 │
-│ Input:  UploadFile (bytes + filename)                           │
-│ Checks: MIME type == application/pdf                            │
-│         File size <= 50MB                                       │
-│         Non-empty                                               │
-│ Action: Generate document_id (UUID)                             │
-│         Save to uploads/{document_id}_{filename}                │
-│ Output: file_path, document_id                                  │
-│ Errors: 400 Bad Request (invalid file)                          │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Step 2: PDF PARSING                                             │
+│ Step 1: DocumentRegistry.update_status(→ "processing")         │
 │                                                                 │
-│ Input:  file_path                                               │
-│ Engine: PyMuPDF (primary), pdfplumber (fallback)                │
-│ Output: ParsedDocument                                          │
-│         ├── pages: [{page_number: 1, raw_text: "...", ...}, ...]│
-│         ├── metadata: {title, author, creation_date, producer}  │
-│         └── page_count: int                                     │
-│ Errors: 422 (corrupted/encrypted PDF)                           │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Step 3: TEXT CLEANING                                            │
+│ Step 2: PDFProcessorService.parse(file_path, document_id)      │
+│   ├── PyMuPDF (primary): ~100 pages/sec                        │
+│   ├── pdfplumber (fallback if chars_per_page < threshold)      │
+│   └── ParsedDocument {pages, pdf_metadata, parser_used}        │
+│   On PDFParsingError → status="error", re-raise                │
 │                                                                 │
-│ Input:  raw text per page                                       │
-│ Operations (in order):                                          │
-│   1. Unicode NFKC normalization                                 │
-│   2. Whitespace normalization                                   │
-│   3. Hyphenated line-break rejoining                            │
-│   4. Header/footer removal (cross-page detection)               │
-│   5. Control character removal                                  │
-│   6. Empty line consolidation                                   │
-│ Output: cleaned full-document text + page boundary offsets      │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Step 4: CHUNKING                                                │
+│ Step 3: TextCleanerService.clean(parsed_document)              │
+│   └── cleaned_text, page_boundary_offsets                      │
 │                                                                 │
-│ Input:  cleaned text, page boundaries, document_id              │
-│ Strategy: Recursive character split                             │
-│   Size:    512 tokens                                           │
-│   Overlap: 64 tokens                                            │
-│   Splits:  \n\n → \n → ". " → " "                              │
-│ Output: list[Chunk]                                             │
-│   Each chunk:                                                   │
-│     ├── chunk_id: UUID                                          │
-│     ├── document_id: UUID                                       │
-│     ├── document_name: str                                      │
-│     ├── chunk_index: int (0, 1, 2, ...)                         │
-│     ├── text: str                                               │
-│     ├── token_count: int                                        │
-│     ├── page_numbers: [int, ...]                                │
-│     ├── start_char_offset: int                                  │
-│     └── end_char_offset: int                                    │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Step 5: EMBEDDING                                               │
+│ Step 4: ChunkerService.chunk(cleaned_text, ..., document_id)   │
+│   ├── Recursive character split: 512 tokens, 64 overlap        │
+│   └── list[Chunk] with {chunk_id, chunk_index, page_numbers,   │
+│         token_count, text, start/end_char_offset}               │
 │                                                                 │
-│ Input:  list[Chunk] (text field)                                │
-│ Model:  text-embedding-3-small (1536 dimensions)                │
-│ Method: Batch API calls (100 chunks/batch, async)               │
-│ Output: list[Chunk] with embedding field populated              │
-│   Each embedding: list[float] of length 1536                    │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Step 6: VECTOR STORAGE                                          │
+│ Step 5: EmbedderService.embed_chunks(chunks)                   │
+│   ├── Batch OpenAI calls (100 chunks/batch)                    │
+│   └── Each chunk.embedding ← 1536-dim float32 vector          │
+│   On EmbeddingAPIError → status="error", re-raise              │
 │                                                                 │
-│ Input:  list[Chunk] with embeddings                             │
-│ Store:  FAISS IndexFlatIP or ChromaDB collection                │
-│ Stored per vector:                                              │
-│   Vector:   1536-dim float32 array                              │
-│   Metadata: {chunk_id, document_id, document_name,              │
-│              chunk_index, page_numbers, token_count, text}       │
-│ Output: Vectors indexed and searchable                          │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Step 7: STATUS UPDATE                                           │
+│ Step 6: VectorStore.add_chunks(chunks)                         │
+│   └── Stores vectors + ChunkMetadata per chunk                 │
+│   On StorageWriteError → status="error", re-raise              │
 │                                                                 │
-│ Document status: "processing" → "ready"                         │
-│ If session_id provided: associate document with session          │
-│ Return: 202 Accepted + DocumentUploadResponse                   │
+│ Step 7: DocumentRegistry.update_status(→ "ready")              │
+│         DocumentRegistry.set_ingestion_metadata(...)           │
+│                                                                 │
+│ Step 8 (optional): SessionStore.add_document_to_session(...)   │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Flow 2: Question Answering
+## Flow 2: Query — Non-Streaming
 
 ```
-User asks a question
-       │
-       ▼
+Client: POST /api/v1/query
+        {"question": "...", "session_id": "...", "top_k": 5}
+              │
+              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ POST /api/v1/query                                              │
-│ Body: {question, session_id, document_ids?, top_k?}             │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
+│ API Handler (query.py)                                          │
+│ 1. Validate QueryRequest (Pydantic)                            │
+│ 2. RAGPipeline.run(question, session_id, document_ids, top_k)  │
+│ 3. Map GeneratedAnswer → QueryResponse                         │
+│ 4. Return 200 OK                                               │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │
+                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ Step 1: SESSION RESOLUTION                                      │
+│ RAGPipeline.run()                                               │
 │                                                                 │
-│ Input:  session_id                                              │
-│ Action: Load session from SessionStore                          │
-│ Output: Session (document_ids, conversation_history)            │
-│ Errors: 404 (session not found or expired)                      │
-│ Latency: <1ms (in-memory lookup)                                │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Step 2: QUERY REFORMULATION (conditional)                       │
+│ Step 1: SessionStore.get_session(session_id)                   │
+│   └── Extract: document_ids, turn_count, conversation_history  │
+│   On not found → SessionNotFoundError (→ 404)                  │
+│   On empty docs → NoDocumentsError (→ 409)                     │
 │                                                                 │
-│ Condition: conversation_history is non-empty                    │
-│ Input:  raw question + conversation history                     │
-│ Model:  gpt-4o-mini (fast, cheap)                               │
-│ Action: LLM resolves pronouns/references into standalone query  │
-│ Example:                                                        │
-│   History: "What was Q3 revenue?"                               │
-│   Follow-up: "How does it compare to Q2?"                       │
-│   Standalone: "How does Q3 revenue compare to Q2 revenue?"      │
-│ Output: standalone_query                                        │
-│ Latency: 0ms (first turn) or 200-400ms (follow-up)             │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Step 3: QUERY EMBEDDING                                         │
+│ Step 2: ResponseCache.get_or_generate(                         │
+│           query, session_id, document_ids, turn_count,         │
+│           generate_fn=<steps 3-11>)                            │
+│   HIT  → return cached GeneratedAnswer (cache_hit=True)        │
+│   MISS → continue ↓                                            │
 │                                                                 │
-│ Input:  standalone_query (text)                                 │
-│ Model:  text-embedding-3-small                                  │
-│ Output: query_embedding (1536-dim vector)                       │
-│ Latency: ~100-150ms                                             │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Step 4: RETRIEVAL (3-stage)                                     │
+│ Step 3: Query Reformulation (conditional)                      │
+│   IF turn_count == 0:  standalone_query = raw_query  (0ms)    │
+│   ELSE: QueryReformulator.reformulate(query, history)          │
+│         Example: "What about their revenue?"                   │
+│             → "What was Acme Corp's Q3 2024 revenue?"          │
 │                                                                 │
-│ Stage A — Vector Search:                                        │
-│   Input: query_embedding, document_ids                          │
-│   Action: cosine similarity search, top_k×2 candidates          │
-│   Latency: 10-50ms (FAISS) / 50-100ms (ChromaDB)               │
+│ Step 4: EmbeddingCache.get_or_embed(standalone_query)          │
+│   HIT  → return cached 1536-dim vector  (~1ms)                │
+│   MISS → EmbeddingService.embed_query() → store  (~150ms)     │
 │                                                                 │
-│ Stage B — Threshold Filter:                                     │
-│   Discard chunks with similarity < 0.70                         │
+│ Step 5: RetrieverService.retrieve(                             │
+│           query_embedding, document_ids, TOP_K_CANDIDATES=10)  │
+│   Stage 1: VectorStore.search() → top-10 candidates           │
+│   Stage 2: discard score < SIMILARITY_THRESHOLD (0.70)        │
+│   Output: list[ScoredChunk] (bi_encoder_score set)             │
 │                                                                 │
-│ Stage C — MMR Re-ranking:                                       │
-│   Select final top_k with diversity (λ=0.7)                     │
+│ Step 6: Reranking (conditional)                                │
+│   IF RerankerService.is_enabled():                             │
+│     RerankerService.rerank(standalone_query, candidates)       │
+│     → similarity_score ← reranker score                       │
+│     → bi_encoder_score preserved for diagnostics              │
+│     → rerank_score set                                         │
+│   ELSE: candidates unchanged                                   │
+│   On RerankerError → log warning, fall back to bi-encoder      │
 │                                                                 │
-│ Output: RetrievedContext                                        │
-│   ├── chunks: [{chunk, score, rank}, ...]                       │
-│   └── metadata: {time_ms, candidates, scores}                   │
-│ Latency: ~50-150ms total                                        │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Step 5: ANSWER GENERATION                                       │
+│ Step 7: RetrieverService.apply_mmr(candidates, top_k=5)        │
+│   MMR: λ·relevance − (1−λ)·max_sim_to_selected               │
+│   Output: final top-5 list[ScoredChunk] (rank set)             │
 │                                                                 │
-│ Input:  standalone_query + retrieved chunks + history            │
-│ Prompt Construction:                                            │
-│   System: "Answer from context only. Cite with [Source N]."     │
-│   Context: Numbered chunks with source metadata                 │
-│   History: Prior Q&A turns                                      │
-│   Question: The standalone query                                │
-│ Model:  gpt-4o (temperature=0.1)                                │
-│ Output: answer text with [Source N] references                  │
-│ Latency: 500-1500ms (full) / 300-500ms to first token           │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Step 6: CITATION EXTRACTION                                     │
+│ Step 8: MemoryManager.get_formatted_history(                   │
+│           session_id, token_budget=1024)                       │
+│   ContextBuilder serialises history ≤ 1024 tokens              │
+│   (trims oldest turns first if over budget)                    │
+│   Output: formatted_history string → QueryContext              │
 │                                                                 │
-│ Input:  raw answer text + chunk metadata                        │
-│ Action: Parse [Source N] references                             │
-│         Map to chunk metadata (doc_name, pages, excerpt)        │
-│         Validate citations against provided context             │
-│ Output: list[Citation]                                          │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Step 7: SESSION UPDATE                                          │
+│ Step 9: QueryContext assembled (all fields populated):         │
+│   raw_query, standalone_query, query_id (new UUID),            │
+│   session_id, document_ids, query_embedding,                   │
+│   formatted_history, reranker_applied, cache_hit=False         │
 │                                                                 │
-│ Append ConversationTurn to session history:                     │
-│   {user_query, standalone_query, response, chunk_ids, timestamp}│
-│ Update last_active_at                                           │
-│ Enforce MAX_CONVERSATION_TURNS (drop oldest if exceeded)        │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ RESPONSE                                                        │
+│ Step 10: RAGChain.invoke(query_context, retrieved_context)     │
+│   ├── Assemble prompt:                                         │
+│   │     system + context_block + history + question            │
+│   ├── OpenAI ChatCompletion (gpt-4o, temperature=0.1)          │
+│   ├── Parse [Source N] citations from output                   │
+│   └── Build GeneratedAnswer (answer_text, citations, confidence│
+│   On GenerationAPIError → 502                                  │
+│   On ContextTooLongError → truncate lowest-scored chunks, retry│
 │                                                                 │
-│ {                                                               │
-│   "answer": "Based on the report, Q3 revenue was $4.2M [1]...",│
-│   "citations": [                                                │
-│     {"document_name": "report.pdf", "page_numbers": [5], ...}  │
-│   ],                                                            │
-│   "confidence": 0.87,                                           │
-│   "retrieval_metadata": {"retrieval_time_ms": 87, ...}          │
-│ }                                                               │
+│ Step 11: MemoryManager.record_turn(session_id, ...)            │
+│   → Append ConversationTurn to session                         │
+│   → Trigger MemoryCompressor if turn_count ≥ threshold        │
+│                                                                 │
+│ Return: GeneratedAnswer (+ pipeline_metadata with all timings) │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Flow 3: Streaming Response (SSE Variant)
+## Flow 3: Query — Streaming (SSE)
 
-Steps 1-4 are identical to Flow 2 (all blocking, pre-stream).
+Steps 1, 3-9 are identical to Flow 2.
 
-At Step 5, instead of waiting for complete generation:
+Step 2 (ResponseCache) is **skipped** — streaming cannot be replayed.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ Step 5 (Streaming): SSE TOKEN DELIVERY                          │
+│ Step 10 (streaming): RAGChain.stream(query_context, retrieved)  │
+│   ├── Assemble prompt (same as sync)                            │
+│   ├── OpenAI ChatCompletion with stream=True                    │
+│   └── Yield tokens as they arrive                               │
 │                                                                 │
-│ Response Headers:                                               │
-│   Content-Type: text/event-stream                               │
-│   Cache-Control: no-cache                                       │
+│   StreamingHandler wraps the generator as SSE:                 │
 │                                                                 │
-│ Events emitted:                                                 │
+│     event: token                                                │
+│     data: {"text": "The", "query_id": "abc-123"}               │
+│     ... (one per token)                                         │
 │                                                                 │
-│   event: token                                                  │
-│   data: {"text": "Based", "query_id": "abc-123"}                │
+│     event: citation                                             │
+│     data: {"citations": [...], "query_id": "abc-123"}           │
 │                                                                 │
-│   event: token                                                  │
-│   data: {"text": " on", "query_id": "abc-123"}                  │
-│   ...                                                           │
+│     event: done                                                 │
+│     data: {"query_id": "abc-123", "total_tokens": 142,          │
+│             "reranker_applied": true, "confidence": 0.87}       │
 │                                                                 │
-│   event: citation                                               │
-│   data: {"citations": [...], "query_id": "abc-123"}             │
-│                                                                 │
-│   event: done                                                   │
-│   data: {"query_id": "abc-123", "total_tokens": 142}            │
-│                                                                 │
-│ Time to first token: ~650-1200ms                                │
-│ Total stream duration: depends on answer length                 │
-└─────────────────────────────────────────────────────────────────┘
+│ Step 11: MemoryManager.record_turn() — after stream exhausted   │
 ```
 
 ---
 
-## Data Model Summary
-
-| Entity | Key Fields | Storage |
-|---|---|---|
-| Document | document_id, filename, status, page_count | In-memory registry |
-| Chunk | chunk_id, document_id, text, embedding, page_numbers | Vector DB |
-| Session | session_id, document_ids, conversation_history | In-memory store |
-| ConversationTurn | user_query, standalone_query, response, citations | Within Session |
-
----
-
-## Latency Budget (Query Path)
+## Latency Budget
 
 | Stage | Typical | Worst Case | Notes |
 |---|---|---|---|
-| Session lookup | <1ms | <1ms | In-memory dict |
-| Query reformulation | 0-400ms | 600ms | Skipped on first turn |
-| Query embedding | 100-150ms | 300ms | Single OpenAI API call |
-| Vector search | 10-50ms | 100ms | FAISS in-memory |
-| Score filtering + MMR | 5-20ms | 50ms | CPU only |
-| LLM first token | 300-500ms | 800ms | OpenAI streaming |
-| **Total to first token** | **~650-1200ms** | **~1850ms** | **Under 2s target** |
+| Session lookup | <1ms | <1ms | in-memory |
+| Response cache check | <1ms | <1ms | cache hit returns immediately |
+| Query reformulation | 0–300ms | 500ms | skipped on first turn |
+| Query embedding | 1–150ms | 300ms | near-zero on cache hit |
+| Vector search | 10–50ms | 100ms | FAISS in-memory |
+| Threshold filter | <1ms | <1ms | CPU only |
+| Cross-encoder reranking | 0–400ms | 600ms | 0 when disabled |
+| MMR selection | 5–20ms | 50ms | CPU only |
+| Memory read | <1ms | <1ms | in-memory |
+| LLM first token | 300–500ms | 800ms | OpenAI streaming |
+| **Total to first token** | **~650–1200ms** | **~1850ms** | **≤ 2s target** |
+
+---
+
+## Data Model Flow
+
+```
+Upload                        Query
+  │                              │
+  ▼                              ▼
+PDFMetadata              QueryContext {
+IngestionMetadata    →       raw_query, standalone_query,
+        │                    query_id, session_id,
+        ▼                    document_ids, query_embedding,
+ChunkMetadata                formatted_history,
+(stored in VectorDB)         reranker_applied, cache_hit
+                         }
+                              │
+                              ▼
+                         RetrievedContext {
+                             chunks: list[ScoredChunk {
+                                 chunk, similarity_score,
+                                 bi_encoder_score,
+                                 rerank_score, rank
+                             }],
+                             retrieval_metadata: RetrievalMetadata
+                         }
+                              │
+                              ▼
+                         GeneratedAnswer {
+                             answer_text, citations,
+                             confidence, query_id,
+                             cache_hit,
+                             retrieval_context,
+                             pipeline_metadata: PipelineMetadata
+                         }
+```

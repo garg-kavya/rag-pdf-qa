@@ -37,5 +37,6 @@ Logging:
 Dependencies:
     - fastapi (Request, Response)
     - fastapi.responses (JSONResponse)
+    - app.exceptions (full exception hierarchy — single import resolves all types)
     - app.utils.logging (get_logger)
 """

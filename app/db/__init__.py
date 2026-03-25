@@ -2,10 +2,11 @@
 Database / Storage Layer
 =========================
 
-Provides vector storage and session storage abstractions:
+Provides all persistence abstractions for the system:
 
-    vector_store   -> Abstract interface for vector DB operations
-    faiss_store    -> FAISS implementation (in-memory, fast)
-    chroma_store   -> ChromaDB implementation (persistent, metadata-rich)
-    session_store  -> In-memory session storage with TTL cleanup
+    vector_store        → Abstract interface for vector DB operations
+    faiss_store         → FAISS in-memory implementation (fast, default)
+    chroma_store        → ChromaDB persistent implementation
+    session_store       → In-memory session CRUD with TTL cleanup
+    document_registry   → In-memory document status and metadata registry
 """

@@ -17,6 +17,9 @@ Business logic services that implement the RAG pipeline stages:
         query_reformulator -> Resolve conversational follow-ups into standalone queries
         generator          -> LLM-powered answer generation with citation awareness
 
+    Reranking:
+        reranker       -> Cross-encoder / Cohere second-pass relevance reranker
+
     Streaming:
         streaming      -> Server-Sent Events token streaming handler
 

@@ -37,7 +37,6 @@ async def health(
     checks["upload_dir"] = "ok" if os.path.isdir(settings.upload_dir) else "error"
 
     all_docs = await registry.get_all()
-    all_sessions = await session_store.cleanup_expired()  # returns count removed
 
     status = "healthy" if all(v == "ok" for v in checks.values()) else "unhealthy"
     http_status = 200 if status == "healthy" else 503

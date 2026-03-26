@@ -1,6 +1,7 @@
 """Document management endpoints."""
 from __future__ import annotations
 
+import os
 from datetime import datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, UploadFile
@@ -48,11 +49,12 @@ async def upload_document(
         file, settings.upload_dir, settings.max_upload_size_mb
     )
 
+    file_size = os.path.getsize(file_path)
     doc = await registry.register(
         document_id=document_id,
         filename=file.filename or "upload.pdf",
         file_path=file_path,
-        file_size_bytes=0,
+        file_size_bytes=file_size,
     )
 
     background_tasks.add_task(
@@ -66,7 +68,7 @@ async def upload_document(
     return DocumentUploadResponse(
         document_id=document_id,
         filename=file.filename or "upload.pdf",
-        file_size_bytes=0,
+        file_size_bytes=file_size,
         status="processing",
         message="Document received and is being processed.",
         created_at=doc.created_at,

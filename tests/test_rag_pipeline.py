@@ -213,8 +213,9 @@ async def test_run_calls_response_cache(pipeline, mock_response_cache):
     mock_response_cache.get_or_generate.assert_called_once()
 
 
-async def test_run_first_turn_no_reformulation(pipeline, mock_session_store,
-                                                mock_reformulator):
+async def test_run_first_turn_still_reformulates(pipeline, mock_session_store,
+                                                  mock_reformulator):
+    """Reformulation now runs on every turn (including first) to expand inferential queries."""
     session = MagicMock()
     session.document_ids = ["doc-1"]
     session.conversation_history = []
@@ -223,7 +224,7 @@ async def test_run_first_turn_no_reformulation(pipeline, mock_session_store,
 
     await pipeline.run("question", "session-1", document_ids=["doc-1"])
 
-    mock_reformulator.reformulate.assert_not_called()
+    mock_reformulator.reformulate.assert_called_once()
 
 
 async def test_run_follow_up_calls_reformulation(pipeline, mock_session_store,

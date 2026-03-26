@@ -78,7 +78,13 @@ class RetrieverService:
         top_k: int | None = None,
         diversity_factor: float | None = None,
     ) -> list[ScoredChunk]:
-        """Stage 3b — Maximal Marginal Relevance diversity selection."""
+        """Stage 3b — Maximal Marginal Relevance diversity selection.
+
+        Uses document_id + chunk_index distance as a diversity signal when
+        embeddings are unavailable (they aren't stored after retrieval).
+        Chunks from different documents or far-apart positions in the same
+        document are treated as more diverse.
+        """
         k = top_k or self._top_k
         lam = diversity_factor if diversity_factor is not None else self._mmr_lambda
 
@@ -87,22 +93,26 @@ class RetrieverService:
                 sc.rank = i + 1
             return candidates
 
-        # Embed scores as 1-d "vectors" for cross-similarity approximation
-        # (full embedding not available at this point; use score as proxy)
         selected: list[ScoredChunk] = []
         remaining = list(candidates)
 
         while len(selected) < k and remaining:
             if not selected:
-                # Pick the highest relevance chunk first
                 best = max(remaining, key=lambda sc: sc.similarity_score)
             else:
-                sel_scores = np.array([s.similarity_score for s in selected])
-
                 def mmr_score(sc: ScoredChunk) -> float:
                     rel = sc.similarity_score
-                    # Use score proximity as cross-similarity proxy
-                    max_sim = float(np.max(np.abs(sel_scores - sc.similarity_score)))
+                    # Cross-similarity: high if candidate is from the same
+                    # document AND nearby chunk_index as an already-selected chunk
+                    max_sim = 0.0
+                    for sel in selected:
+                        if sc.chunk.document_id == sel.chunk.document_id:
+                            idx_dist = abs(sc.chunk.chunk_index - sel.chunk.chunk_index)
+                            # Adjacent chunks (dist<=1) → sim=1.0, decays with distance
+                            sim = 1.0 / (1.0 + idx_dist)
+                        else:
+                            sim = 0.0  # different documents → maximally diverse
+                        max_sim = max(max_sim, sim)
                     return lam * rel - (1 - lam) * max_sim
 
                 best = max(remaining, key=mmr_score)

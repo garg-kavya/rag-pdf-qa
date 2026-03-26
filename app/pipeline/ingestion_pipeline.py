@@ -71,6 +71,12 @@ class IngestionPipeline:
         )
         logger.info("Created %d chunks", len(chunks), extra={"document_id": document_id})
 
+        if not chunks:
+            await self._registry.update_status(
+                document_id, "error", "No text chunks could be created from this PDF."
+            )
+            raise PDFParsingError("PDF produced no usable text chunks after cleaning.")
+
         # Step 5 — Batch embedding
         try:
             chunks = await self._embedder.embed_chunks(chunks)

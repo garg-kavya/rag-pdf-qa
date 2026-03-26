@@ -82,8 +82,8 @@ API Layer  (all endpoints require Authorization: Bearer <token>)
 ### 1. Clone and configure
 
 ```bash
-git clone https://github.com/garg-kavya/rag-pdf-qa
-cd rag-pdf-qa
+git clone https://github.com/garg-kavya/DocMind
+cd DocMind
 cp .env.example .env
 # Edit .env and set OPENAI_API_KEY=sk-...
 ```

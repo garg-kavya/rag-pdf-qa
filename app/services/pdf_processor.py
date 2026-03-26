@@ -76,7 +76,10 @@ class PDFProcessorService:
                 ) from exc
 
         # If both text-based parsers produced little text, try OCR as last resort
+        ocr_attempted = False
+        ocr_error: str | None = None
         if result.total_chars < MINIMUM_CHARS_PER_PAGE:
+            ocr_attempted = True
             try:
                 ocr_result = self._parse_ocr(file_path, document_id)
                 if ocr_result.total_chars >= MINIMUM_CHARS_PER_PAGE:
@@ -87,13 +90,20 @@ class PDFProcessorService:
                     )
                     result = ocr_result
             except Exception as exc:
+                ocr_error = str(exc)
                 logger.warning("OCR fallback failed: %s", exc, extra={"document_id": document_id})
 
         if result.total_chars < MINIMUM_CHARS_PER_PAGE:
+            if ocr_attempted and ocr_error:
+                hint = (
+                    "OCR was attempted but failed (poppler/tesseract may not be installed). "
+                    f"OCR error: {ocr_error}"
+                )
+            else:
+                hint = "Please use a text-based PDF or install tesseract-ocr and poppler-utils."
             raise PDFParsingError(
-                "PDF contains no extractable text. "
-                "It may be a scanned image-only PDF. "
-                "Please use a text-based PDF.",
+                "PDF contains no extractable text. It appears to be a scanned image-only PDF. "
+                + hint,
                 detail=f"Total chars extracted: {result.total_chars}",
             )
 
@@ -228,11 +238,26 @@ class PDFProcessorService:
 
     def _parse_ocr(self, file_path: str, document_id: str) -> ParsedDocument:
         """OCR fallback for scanned/image-only PDFs using pytesseract + pdf2image."""
+        import sys
         import pytesseract
         from pdf2image import convert_from_path
 
+        # Windows: set explicit paths if the tools are not on PATH
+        if sys.platform == "win32":
+            import shutil
+            if not shutil.which("tesseract"):
+                pytesseract.pytesseract.tesseract_cmd = (
+                    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+                )
+            _poppler_path = (
+                r"C:\poppler\poppler-24.08.0\Library\bin"
+                if not shutil.which("pdftoppm") else None
+            )
+        else:
+            _poppler_path = None
+
         pages: list[PageContent] = []
-        images = convert_from_path(file_path, dpi=200)
+        images = convert_from_path(file_path, dpi=200, poppler_path=_poppler_path)
         for i, img in enumerate(images):
             text = pytesseract.image_to_string(img) or ""
             pages.append(PageContent(

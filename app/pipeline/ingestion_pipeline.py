@@ -55,8 +55,8 @@ class IngestionPipeline:
         # Step 2 — PDF parsing
         try:
             parsed = self._pdf.parse(file_path, document_id)
-        except PDFParsingError:
-            await self._registry.update_status(document_id, "error", "PDF parsing failed.")
+        except PDFParsingError as exc:
+            await self._registry.update_status(document_id, "error", exc.message)
             raise
 
         # Step 3 — Text cleaning

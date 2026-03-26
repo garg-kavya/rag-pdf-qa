@@ -28,3 +28,9 @@ class VectorStore(ABC):
     @abstractmethod
     async def get_collection_stats(self) -> dict:
         """Return total_vectors, total_documents, index_type, dimensions."""
+
+    async def save_to_disk(self) -> None:
+        """Persist index to disk. No-op for backends with built-in persistence."""
+
+    async def load_from_disk(self) -> None:
+        """Load index from disk. No-op for backends with built-in persistence."""

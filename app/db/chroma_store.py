@@ -33,6 +33,7 @@ class ChromaStore(VectorStore):
             embeddings.append(chunk.embedding)
             documents.append(chunk.text)
             metadatas.append({
+                "chunk_id": chunk.chunk_id,
                 "document_id": chunk.document_id,
                 "document_name": chunk.document_name,
                 "chunk_index": chunk.chunk_index,
@@ -49,17 +50,26 @@ class ChromaStore(VectorStore):
         except Exception as exc:
             raise StorageWriteError(f"ChromaDB add failed: {exc}") from exc
 
+        logger.info("Added %d vectors to ChromaDB collection", len(chunks))
+
     async def search(
         self,
         query_embedding: list[float],
         top_k: int,
         document_ids: list[str] | None = None,
     ) -> list[tuple[Chunk, float]]:
+        # Guard: ChromaDB raises if n_results > collection size
+        count = self._collection.count()
+        if count == 0:
+            return []
+
         where = {"document_id": {"$in": document_ids}} if document_ids else None
+        n_results = min(top_k, count)
+
         try:
             result = self._collection.query(
                 query_embeddings=[query_embedding],
-                n_results=top_k,
+                n_results=n_results,
                 where=where,
                 include=["documents", "metadatas", "distances"],
             )
@@ -67,7 +77,7 @@ class ChromaStore(VectorStore):
             raise StorageReadError(f"ChromaDB search failed: {exc}") from exc
 
         chunks_scores: list[tuple[Chunk, float]] = []
-        for doc, meta, dist in zip(
+        for doc_text, meta, dist in zip(
             result["documents"][0],
             result["metadatas"][0],
             result["distances"][0],
@@ -77,13 +87,13 @@ class ChromaStore(VectorStore):
                 document_id=meta["document_id"],
                 document_name=meta["document_name"],
                 chunk_index=meta["chunk_index"],
-                text=doc,
+                text=doc_text,
                 token_count=meta["token_count"],
                 page_numbers=json.loads(meta["page_numbers"]),
                 start_char_offset=0,
                 end_char_offset=0,
             )
-            # ChromaDB distance → similarity (cosine distance = 1 - similarity)
+            # ChromaDB cosine distance → similarity (distance = 1 - similarity)
             score = 1.0 - dist
             chunks_scores.append((chunk, score))
 
@@ -98,9 +108,15 @@ class ChromaStore(VectorStore):
 
     async def get_collection_stats(self) -> dict:
         count = self._collection.count()
+        # Count unique documents from metadata
+        total_documents = 0
+        if count > 0:
+            all_meta = self._collection.get(include=["metadatas"])
+            doc_ids = {m["document_id"] for m in all_meta.get("metadatas", []) if m}
+            total_documents = len(doc_ids)
         return {
             "total_vectors": count,
-            "total_documents": 0,  # ChromaDB doesn't expose this natively
+            "total_documents": total_documents,
             "index_type": "ChromaDB",
             "dimensions": 1536,
         }

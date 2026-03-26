@@ -8,14 +8,25 @@ faiss-cpu==1.13.2
 PyMuPDF==1.27.2.2
 pdfplumber==0.11.9
 tiktoken==0.12.0
-pydantic==2.12.5
+pydantic[email]==2.12.5
 pydantic-settings==2.13.1
 python-multipart==0.0.22
 numpy==2.4.3
 aiofiles==25.1.0
 httpx==0.28.1
 
+# Authentication
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+aiosqlite==0.20.0
+
+# ChromaDB vector store (default)
+chromadb==0.6.3
+
+# PDF OCR fallback (requires tesseract-ocr system package)
+pytesseract==0.3.13
+pdf2image==1.17.0
+
 # Optional — only loaded when enabled via env vars
 # RERANKER_BACKEND=cohere   → cohere
 # RERANKER_BACKEND=cross_encoder → sentence-transformers
-# VECTOR_STORE_TYPE=chroma  → chromadb

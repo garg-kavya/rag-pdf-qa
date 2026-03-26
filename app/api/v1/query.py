@@ -4,7 +4,8 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
-from app.dependencies import get_rag_pipeline
+from app.dependencies import get_current_user, get_rag_pipeline
+from app.models.user import User
 from app.pipeline.rag_pipeline import RAGPipeline
 from app.schemas.query import (
     CitationSchema,
@@ -22,6 +23,7 @@ router = APIRouter(tags=["query"])
 async def query(
     body: QueryRequest,
     pipeline: RAGPipeline = Depends(get_rag_pipeline),
+    current_user: User = Depends(get_current_user),
 ):
     answer = await pipeline.run(
         raw_query=body.question,
@@ -88,6 +90,7 @@ async def query(
 async def query_stream(
     body: QueryRequest,
     pipeline: RAGPipeline = Depends(get_rag_pipeline),
+    current_user: User = Depends(get_current_user),
 ) -> StreamingResponse:
     query_id_holder: list[str] = ["unknown"]
 

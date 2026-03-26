@@ -16,6 +16,12 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 # ── Stage 2: runtime ────────────────────────────────────────────────────────
 FROM python:3.12-slim AS runtime
 
+# System packages: tesseract-ocr + poppler (pdf2image) for OCR fallback
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy installed packages from builder (no build tools in final image)
 COPY --from=builder /install /usr/local
 

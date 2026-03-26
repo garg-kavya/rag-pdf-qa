@@ -1,8 +1,10 @@
 """FastAPI Dependency Injection — composition root."""
 from __future__ import annotations
 
-from fastapi import Request
+from fastapi import Depends, HTTPException, Request, status
+from jose import JWTError
 
+from app.auth.jwt_handler import decode_access_token, oauth2_scheme
 from app.cache.embedding_cache import EmbeddingCache
 from app.cache.in_memory_cache import InMemoryCache
 from app.cache.response_cache import ResponseCache
@@ -10,10 +12,12 @@ from app.chains.rag_chain import RAGChain
 from app.config import Settings, get_settings
 from app.db.document_registry import DocumentRegistry
 from app.db.session_store import SessionStore
+from app.db.user_store import UserStore
 from app.db.vector_store import VectorStore
 from app.memory.context_builder import ContextBuilder
 from app.memory.memory_compressor import MemoryCompressor
 from app.memory.memory_manager import MemoryManager
+from app.models.user import User
 from app.pipeline.ingestion_pipeline import IngestionPipeline
 from app.pipeline.rag_pipeline import RAGPipeline
 from app.services.chunker import ChunkerService
@@ -44,6 +48,7 @@ def build_app_state(settings: Settings) -> dict:
     _data_dir = settings.vector_store_path  # e.g. "./data"
     session_store = SessionStore(settings, persist_path=f"{_data_dir}/sessions.json")
     document_registry = DocumentRegistry(persist_path=f"{_data_dir}/registry.json")
+    user_store = UserStore(db_path=f"{_data_dir}/users.db")
 
     # Cache
     shared_cache = InMemoryCache(
@@ -113,6 +118,7 @@ def build_app_state(settings: Settings) -> dict:
         "vector_store": vector_store,
         "session_store": session_store,
         "document_registry": document_registry,
+        "user_store": user_store,
         "embedding_cache": embedding_cache,
         "response_cache": response_cache,
         "rag_pipeline": rag_pipeline,
@@ -150,3 +156,31 @@ def get_vector_store(request: Request) -> VectorStore:
 
 def get_response_cache(request: Request) -> ResponseCache:
     return request.app.state.response_cache
+
+
+def get_user_store(request: Request) -> UserStore:
+    return request.app.state.user_store
+
+
+async def get_current_user(
+    request: Request,
+    token: str = Depends(oauth2_scheme),
+) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = decode_access_token(token)
+        user_id: str = payload.get("sub", "")
+        if not user_id:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    user_store: UserStore = request.app.state.user_store
+    user = await user_store.get_by_id(user_id)
+    if user is None:
+        raise credentials_exception
+    return user

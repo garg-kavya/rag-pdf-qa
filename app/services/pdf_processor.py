@@ -75,6 +75,20 @@ class PDFProcessorService:
                     detail=str(exc),
                 ) from exc
 
+        # If both text-based parsers produced little text, try OCR as last resort
+        if result.total_chars < MINIMUM_CHARS_PER_PAGE:
+            try:
+                ocr_result = self._parse_ocr(file_path, document_id)
+                if ocr_result.total_chars >= MINIMUM_CHARS_PER_PAGE:
+                    logger.info(
+                        "OCR extracted %d chars from scanned PDF",
+                        ocr_result.total_chars,
+                        extra={"document_id": document_id},
+                    )
+                    result = ocr_result
+            except Exception as exc:
+                logger.warning("OCR fallback failed: %s", exc, extra={"document_id": document_id})
+
         if result.total_chars < MINIMUM_CHARS_PER_PAGE:
             raise PDFParsingError(
                 "PDF contains no extractable text. "
@@ -209,6 +223,34 @@ class PDFProcessorService:
             pages=pages,
             pdf_metadata=pdf_metadata,
             parser_used="pdfplumber",
+        )
+
+
+    def _parse_ocr(self, file_path: str, document_id: str) -> ParsedDocument:
+        """OCR fallback for scanned/image-only PDFs using pytesseract + pdf2image."""
+        import pytesseract
+        from pdf2image import convert_from_path
+
+        pages: list[PageContent] = []
+        images = convert_from_path(file_path, dpi=200)
+        for i, img in enumerate(images):
+            text = pytesseract.image_to_string(img) or ""
+            pages.append(PageContent(
+                page_number=i + 1,
+                raw_text=text,
+                char_count=len(text),
+            ))
+
+        pdf_metadata = PDFMetadata(
+            page_count=len(pages),
+            file_size_bytes=os.path.getsize(file_path),
+            parser_used="ocr",
+        )
+        return ParsedDocument(
+            document_id=document_id,
+            pages=pages,
+            pdf_metadata=pdf_metadata,
+            parser_used="ocr",
         )
 
 

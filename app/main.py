@@ -38,11 +38,12 @@ async def lifespan(app: FastAPI):
     for key, value in state.items():
         setattr(app.state, key, value)
 
-    # Restore persisted state: FAISS vectors, document registry, sessions
+    # Restore persisted state: vectors, document registry, sessions, users
     await app.state.vector_store.load_from_disk()
     await app.state.document_registry.load_from_disk()
     await app.state.session_store.load_from_disk()
-    logger.info("RAG PDF Q&A service started")
+    await app.state.user_store.create_table()
+    logger.info("DocMind service started")
 
     # Background: periodic session cleanup
     async def _cleanup_loop():

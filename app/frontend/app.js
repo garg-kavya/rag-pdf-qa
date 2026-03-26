@@ -12,7 +12,79 @@
    }
 ──────────────────────────────────────────────────────── */
 
-const STORE_KEY = 'rag_store';
+const STORE_KEY  = 'rag_store';
+const AUTH_KEY   = 'rag_auth';   // { token, user_id, email }
+
+/* ─── Auth helpers ───────────────────────────────────── */
+function getAuth()  { try { return JSON.parse(localStorage.getItem(AUTH_KEY)) || null; } catch { return null; } }
+function setAuth(a) { localStorage.setItem(AUTH_KEY, JSON.stringify(a)); }
+function clearAuth(){ localStorage.removeItem(AUTH_KEY); }
+
+function switchAuthTab(tab) {
+  document.getElementById('loginForm').classList.toggle('hidden', tab !== 'login');
+  document.getElementById('registerForm').classList.toggle('hidden', tab !== 'register');
+  document.getElementById('tabLogin').classList.toggle('active', tab === 'login');
+  document.getElementById('tabRegister').classList.toggle('active', tab === 'register');
+  document.getElementById('loginError').textContent = '';
+  document.getElementById('registerError').textContent = '';
+}
+
+async function handleLogin(e) {
+  e.preventDefault();
+  const btn = document.getElementById('loginBtn');
+  const errEl = document.getElementById('loginError');
+  errEl.textContent = '';
+  btn.disabled = true;
+  btn.textContent = 'Signing in…';
+  try {
+    const data = await apiFetch('/api/v1/auth/login', 'POST', {
+      email: document.getElementById('loginEmail').value,
+      password: document.getElementById('loginPassword').value,
+    });
+    setAuth({ token: data.access_token, user_id: data.user_id, email: data.email });
+    showMainApp();
+  } catch (err) {
+    errEl.textContent = err.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Sign In';
+  }
+}
+
+async function handleRegister(e) {
+  e.preventDefault();
+  const btn = document.getElementById('registerBtn');
+  const errEl = document.getElementById('registerError');
+  errEl.textContent = '';
+  btn.disabled = true;
+  btn.textContent = 'Creating…';
+  try {
+    const data = await apiFetch('/api/v1/auth/register', 'POST', {
+      email: document.getElementById('regEmail').value,
+      password: document.getElementById('regPassword').value,
+    });
+    setAuth({ token: data.access_token, user_id: data.user_id, email: data.email });
+    showMainApp();
+  } catch (err) {
+    errEl.textContent = err.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Create Account';
+  }
+}
+
+function handleLogout() {
+  clearAuth();
+  document.getElementById('mainApp').style.display = 'none';
+  document.getElementById('authOverlay').style.display = 'flex';
+}
+
+function showMainApp() {
+  const auth = getAuth();
+  document.getElementById('authOverlay').style.display = 'none';
+  document.getElementById('mainApp').style.display = 'flex';
+  if (auth) document.getElementById('footerUser').textContent = auth.email;
+}
 
 /* ─── Persistent store helpers ──────────────────────── */
 function getStore() {
@@ -66,6 +138,14 @@ const inputHint       = $('inputHint');
 
 /* ─── Bootstrap ─────────────────────────────────────── */
 document.addEventListener('DOMContentLoaded', async () => {
+  // Show auth overlay or main app depending on stored token
+  const auth = getAuth();
+  if (auth && auth.token) {
+    showMainApp();
+  } else {
+    // Auth overlay is visible by default
+  }
+
   fileInput.addEventListener('change', e => {
     const file = e.target.files[0];
     if (file) handleUpload(file);
@@ -82,8 +162,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
   uploadZone.addEventListener('click', e => { if (e.target === uploadZone) fileInput.click(); });
 
-  await restoreLastSession();
-  renderChatHistory();
+  if (auth && auth.token) {
+    await restoreLastSession();
+    renderChatHistory();
+  }
 });
 
 /* ─── Session restore ───────────────────────────────── */
@@ -254,7 +336,10 @@ async function handleUpload(file) {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('session_id', state.sessionId);
-    const resp = await fetch('/api/v1/documents/upload', { method: 'POST', body: formData });
+    const uploadHeaders = {};
+    const authData = getAuth();
+    if (authData && authData.token) uploadHeaders['Authorization'] = `Bearer ${authData.token}`;
+    const resp = await fetch('/api/v1/documents/upload', { method: 'POST', headers: uploadHeaders, body: formData });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
       throw new Error(err?.error?.message || `Upload failed (${resp.status})`);
@@ -350,13 +435,22 @@ async function streamQuery(question, contentEl, rowEl) {
     session_id:   state.sessionId,
     document_ids: state.documentIds,
   };
+  const streamAuth = getAuth();
+  const streamHeaders = { 'Content-Type': 'application/json' };
+  if (streamAuth && streamAuth.token) streamHeaders['Authorization'] = `Bearer ${streamAuth.token}`;
   const resp = await fetch('/api/v1/query/stream', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    method: 'POST', headers: streamHeaders,
     body: JSON.stringify(payload),
   });
+  if (resp.status === 401) {
+    clearAuth();
+    document.getElementById('mainApp').style.display = 'none';
+    document.getElementById('authOverlay').style.display = 'flex';
+    throw new Error('Session expired. Please sign in again.');
+  }
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `Server error (${resp.status})`);
+    throw new Error(err?.detail || err?.error?.message || `Server error (${resp.status})`);
   }
 
   const reader    = resp.body.getReader();
@@ -604,12 +698,22 @@ function showToast(msg, type = '') {
 
 /* ─── API helper ─────────────────────────────────────── */
 async function apiFetch(path, method = 'GET', body = undefined) {
-  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  const auth = getAuth();
+  const headers = { 'Content-Type': 'application/json' };
+  if (auth && auth.token) headers['Authorization'] = `Bearer ${auth.token}`;
+  const opts = { method, headers };
   if (body !== undefined) opts.body = JSON.stringify(body);
   const resp = await fetch(path, opts);
+  if (resp.status === 401) {
+    // Token expired or invalid — force re-login
+    clearAuth();
+    document.getElementById('mainApp').style.display = 'none';
+    document.getElementById('authOverlay').style.display = 'flex';
+    throw new Error('Session expired. Please sign in again.');
+  }
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `Request failed (${resp.status})`);
+    throw new Error(err?.detail || err?.error?.message || `Request failed (${resp.status})`);
   }
   return resp.json();
 }

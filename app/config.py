@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     split_separators: list[str] = ["\n\n", "\n", ". ", " "]
 
     # --- Retrieval ---
-    vector_store_type: Literal["faiss", "chroma"] = "faiss"
+    vector_store_type: Literal["faiss", "chroma"] = "chroma"
     top_k: int = 5
     top_k_candidates: int = 10
     similarity_threshold: float = 0.0
@@ -66,6 +66,11 @@ class Settings(BaseSettings):
     session_ttl_minutes: int = 60
     max_conversation_turns: int = 10
     session_cleanup_interval_seconds: int = 300
+
+    # --- Auth ---
+    jwt_secret_key: str = "change-me-in-production-use-a-long-random-string"
+    jwt_algorithm: str = "HS256"
+    jwt_access_token_expire_minutes: int = 60 * 24 * 7  # 7 days
 
     # --- Server ---
     host: str = "0.0.0.0"

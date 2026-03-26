@@ -9,12 +9,14 @@ from app.cache.response_cache import ResponseCache
 from app.db.document_registry import DocumentRegistry
 from app.db.vector_store import VectorStore
 from app.dependencies import (
+    get_current_user,
     get_document_registry,
     get_ingestion_pipeline,
     get_response_cache,
     get_settings,
     get_vector_store,
 )
+from app.models.user import User
 from app.exceptions import DocumentNotFoundError, InvalidFileTypeError
 from app.pipeline.ingestion_pipeline import IngestionPipeline
 from app.schemas.document import (
@@ -36,6 +38,7 @@ async def upload_document(
     pipeline: IngestionPipeline = Depends(get_ingestion_pipeline),
     registry: DocumentRegistry = Depends(get_document_registry),
     settings=Depends(get_settings),
+    current_user: User = Depends(get_current_user),
 ):
     if not file.content_type or "pdf" not in file.content_type.lower():
         # Allow even if content_type isn't set — validate_pdf via magic bytes
@@ -74,6 +77,7 @@ async def upload_document(
 async def get_document(
     document_id: str,
     registry: DocumentRegistry = Depends(get_document_registry),
+    current_user: User = Depends(get_current_user),
 ):
     doc = await registry.get(document_id)
     if doc is None:
@@ -85,6 +89,7 @@ async def get_document(
 async def list_documents(
     status: str | None = None,
     registry: DocumentRegistry = Depends(get_document_registry),
+    current_user: User = Depends(get_current_user),
 ):
     docs = await registry.get_all(status=status)
     return DocumentListResponse(
@@ -99,6 +104,7 @@ async def delete_document(
     registry: DocumentRegistry = Depends(get_document_registry),
     vector_store: VectorStore = Depends(get_vector_store),
     response_cache: ResponseCache = Depends(get_response_cache),
+    current_user: User = Depends(get_current_user),
 ):
     doc = await registry.get(document_id)
     if doc is None:

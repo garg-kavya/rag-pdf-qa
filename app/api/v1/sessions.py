@@ -7,8 +7,9 @@ from fastapi import APIRouter, Depends
 
 from app.cache.response_cache import ResponseCache
 from app.db.session_store import SessionStore
-from app.dependencies import get_response_cache, get_session_store
+from app.dependencies import get_current_user, get_response_cache, get_session_store
 from app.exceptions import SessionNotFoundError
+from app.models.user import User
 from app.schemas.session import (
     ConversationTurnSchema,
     SessionCreateRequest,
@@ -24,6 +25,7 @@ router = APIRouter(prefix="/sessions", tags=["sessions"])
 async def create_session(
     body: SessionCreateRequest,
     store: SessionStore = Depends(get_session_store),
+    current_user: User = Depends(get_current_user),
 ):
     session = await store.create_session(body.document_ids or [])
     expires_at = store.expires_at(session)
@@ -40,6 +42,7 @@ async def create_session(
 async def get_session(
     session_id: str,
     store: SessionStore = Depends(get_session_store),
+    current_user: User = Depends(get_current_user),
 ):
     session = await store.get_session(session_id)
     if session is None:
@@ -72,6 +75,7 @@ async def delete_session(
     session_id: str,
     store: SessionStore = Depends(get_session_store),
     response_cache: ResponseCache = Depends(get_response_cache),
+    current_user: User = Depends(get_current_user),
 ):
     turns_cleared = await store.delete_session(session_id)
     if turns_cleared is None:

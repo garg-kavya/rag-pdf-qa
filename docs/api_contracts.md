@@ -2,6 +2,101 @@
 
 All endpoints are prefixed with `/api/v1`. All request/response bodies are JSON unless specified otherwise.
 
+All endpoints except `/auth/register`, `/auth/login`, and `/health` require:
+```
+Authorization: Bearer <access_token>
+```
+A missing or invalid token returns `401 Unauthorized`.
+
+---
+
+## 0. Authentication
+
+### `POST /api/v1/auth/register`
+
+#### Request Body
+
+```json
+{
+    "email": "user@example.com",
+    "password": "mysecretpassword"
+}
+```
+
+#### Response — `201 Created`
+
+```json
+{
+    "user_id": "e5f6a7b8-c9d0-1234-abcd-567890123456",
+    "email": "user@example.com",
+    "created_at": "2026-03-26T10:00:00Z"
+}
+```
+
+#### Error Response
+
+**409 Conflict — Email already registered:**
+```json
+{
+    "error": {
+        "type": "ValidationError",
+        "message": "Email already registered.",
+        "request_id": "req-abc-100"
+    }
+}
+```
+
+---
+
+### `POST /api/v1/auth/login`
+
+**Content-Type:** `application/x-www-form-urlencoded` (OAuth2 password flow)
+
+#### Request Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `username` | string | User's email address |
+| `password` | string | User's password |
+
+#### Response — `200 OK`
+
+```json
+{
+    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "token_type": "bearer"
+}
+```
+
+#### Error Response
+
+**401 Unauthorized — Invalid credentials:**
+```json
+{
+    "error": {
+        "type": "ValidationError",
+        "message": "Invalid email or password.",
+        "request_id": "req-abc-101"
+    }
+}
+```
+
+---
+
+### `GET /api/v1/auth/me`
+
+Requires `Authorization: Bearer <token>`.
+
+#### Response — `200 OK`
+
+```json
+{
+    "user_id": "e5f6a7b8-c9d0-1234-abcd-567890123456",
+    "email": "user@example.com",
+    "created_at": "2026-03-26T10:00:00Z"
+}
+```
+
 ---
 
 ## 1. PDF Upload
@@ -490,14 +585,14 @@ data: {"message": "Generation interrupted: OpenAI API timeout", "query_id": "q-f
 
 ### `GET /api/v1/debug/index`
 
-Returns FAISS index statistics and the list of documents currently stored in the vector index. Useful for diagnosing ingestion issues.
+Returns vector index statistics and the list of documents currently stored. Useful for diagnosing ingestion issues.
 
 #### Response — `200 OK`
 
 ```json
 {
     "total_vectors": 184,
-    "index_type": "IndexFlatIP",
+    "index_type": "ChromaDB",
     "documents_in_registry": 3,
     "document_ids_in_index": [
         "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
@@ -563,10 +658,14 @@ All error responses follow this structure:
 | HTTP Status | Error Type | When |
 |---|---|---|
 | 400 | `ValidationError` | Invalid request parameters |
+| 401 | `HTTPException` | Missing or invalid JWT token |
 | 404 | `DocumentNotFoundError` | Document ID not found |
 | 404 | `SessionNotFoundError` | Session ID not found or expired |
+| 409 | `ValidationError` | Email already registered |
 | 410 | `SessionExpiredError` | Session existed but TTL elapsed |
 | 422 | `PDFParsingError` | PDF is corrupted, encrypted, or unreadable |
+| 422 | `ChunkingError` | PDF produced no usable text chunks |
 | 429 | `RateLimitError` | Too many requests |
 | 500 | `InternalError` | Unexpected server error |
 | 502 | `UpstreamError` | OpenAI API failure |
+| 504 | `EmbeddingTimeoutError` / `GenerationTimeoutError` | Upstream timeout |

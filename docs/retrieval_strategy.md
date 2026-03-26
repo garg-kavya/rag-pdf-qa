@@ -2,6 +2,23 @@
 
 ---
 
+## Query Reformulation (Pre-Retrieval)
+
+Before the retrieval pipeline runs, `QueryReformulator` expands the raw query into a more searchable form. This step **always runs** (not conditional on conversation history).
+
+Two transformations:
+
+1. **Coreference resolution** — anchors follow-up queries to their subjects:
+   > "What about their revenue?" → "What was Acme Corp's Q3 2024 revenue?"
+
+2. **Inference expansion** — rewrites vague evaluation questions into explicit search terms:
+   > "Is he a bad guy?" → "professional misconduct unethical behaviour criminal record character flaws"
+   > "Should I hire her?" → "qualifications skills experience achievements suitability"
+
+The expanded `standalone_query` is what gets embedded and passed to the vector store — dramatically improving recall for indirect questions.
+
+---
+
 ## Pipeline Overview
 
 The retrieval pipeline is a four-stage process owned by `RAGPipeline` and executed by `RetrieverService` and `RerankerService`.
@@ -14,10 +31,10 @@ EmbeddingCache.get_or_embed(standalone_query)
 RetrieverService.retrieve(query_embedding, document_ids, TOP_K_CANDIDATES)
     │
     ├── Stage 1: VectorStore.search()       bi-encoder cosine similarity
-    │             over-fetch top-10 candidates
+    │             over-fetch top-20 candidates
     │
-    └── Stage 2: Score threshold filter    discard score < 0.70
-          │
+    └── Stage 2: Score threshold filter    discard score < SIMILARITY_THRESHOLD
+          │                                (default: 0.0 = disabled)
           │  list[ScoredChunk] with bi_encoder_score set
           ▼
 RerankerService.rerank(standalone_query, candidates)   [optional]
@@ -25,7 +42,7 @@ RerankerService.rerank(standalone_query, candidates)   [optional]
     │  list[ScoredChunk] with similarity_score = reranker score
     │  (bi_encoder_score preserved for diagnostics)
     ▼
-RetrieverService.apply_mmr(candidates, top_k=5)
+RetrieverService.apply_mmr(candidates, top_k=10)
     │
     │  final top-k diverse, relevant chunks
     ▼
@@ -37,26 +54,26 @@ RAGChain.invoke(query_context, retrieved_context)
 ## Stage 1: Vector Similarity Search
 
 - **Algorithm:** Cosine similarity (dot product on L2-normalised vectors)
-- **Index:** FAISS `IndexFlatIP` (exhaustive, exact) for datasets < 500K vectors
+- **Index:** ChromaDB persistent collection (default); FAISS `IndexFlatIP` (optional)
 - **Scoping:** `document_ids` filter limits search to session documents
-- **Over-fetch:** retrieves `TOP_K_CANDIDATES = TOP_K × 2` (default: 10)
+- **Over-fetch:** retrieves `TOP_K_CANDIDATES = 20` (= `TOP_K × 2`)
   so the reranker and MMR have enough candidates to work with
 
-FAISS latency: 10–50ms for typical PDF workloads (1K–100K vectors)
+ChromaDB latency: 10–100ms for typical PDF workloads (1K–100K vectors)
 
 ---
 
 ## Stage 2: Score Threshold Filtering
 
-**Threshold:** `SIMILARITY_THRESHOLD = 0.70` (configurable)
+**Threshold:** `SIMILARITY_THRESHOLD = 0.0` (default: disabled)
 
-Purpose: eliminate chunks that are in the top-10 by cosine distance but are not genuinely relevant. Prevents noise from reaching the LLM even when the query doesn't have strong document matches.
+With `text-embedding-3-small`, cosine similarity for semantically related (but not near-identical) text typically falls in the **0.10–0.29** range — far below the 0.70 threshold used in dense retrieval systems. The default of `0.0` disables filtering so all retrieved candidates proceed to MMR.
 
-Calibration with `text-embedding-3-small`:
-- 0.80+: very strong match (same topic + subtopic)
-- 0.70–0.80: relevant match (same topic)
-- 0.60–0.70: marginal (same domain, different topic)
-- <0.60: unrelated
+If you are seeing irrelevant chunks in answers, calibrate against your document set:
+- 0.25+: strong semantic overlap
+- 0.15–0.25: relevant match
+- 0.05–0.15: marginal
+- <0.05: likely unrelated
 
 After this stage, each `ScoredChunk` has `bi_encoder_score` set and `similarity_score == bi_encoder_score`.
 
@@ -84,12 +101,17 @@ After this stage, each `ScoredChunk` has `bi_encoder_score` set and `similarity_
 **Formula:**
 ```
 score(chunk_i) = λ · similarity_score(chunk_i, query)
-               − (1−λ) · max(similarity_score(chunk_i, selected_j))
+               − (1−λ) · max_diversity_penalty(chunk_i, selected)
 ```
+
+**Diversity signal** (chunk position distance):
+- Same document: `penalty = 1 / (1 + |chunk_index_i − chunk_index_j|)`
+  → adjacent chunks (dist ≤ 1) penalized heavily; distant chunks allowed
+- Different document: `penalty = 0.0` (maximally diverse by definition)
 
 **λ = MMR_DIVERSITY_FACTOR = 0.7** (favour relevance, mild diversity)
 
-**Purpose:** Prevents the top-k from being 5 near-identical chunks from the same paragraph. Forces coverage of different aspects of the answer.
+**Purpose:** Prevents the top-k from being near-identical adjacent chunks from the same paragraph. Forces coverage of different sections and documents.
 
 **When MMR is skipped:** If `len(candidates) ≤ top_k`, all candidates are returned without MMR calculation (no diversity gain possible).
 
@@ -125,22 +147,22 @@ Reasons:
 | k | Use case | Notes |
 |---|---|---|
 | 3 | Simple factual lookup | Fast, minimal context |
-| **5** | **General Q&A (default)** | **Best balance** |
-| 7 | Analytical questions | Broader coverage |
-| 10 | Synthesis / summarization | Maximum coverage, more noise |
+| 5 | Narrow Q&A | Lower noise |
+| **10** | **General Q&A (default)** | **Best balance for inference queries** |
+| 15 | Synthesis / summarization | Maximum coverage, more noise |
 
-Per-query override available via the API `top_k` parameter (range 3–10).
+Per-query override available via the API `top_k` parameter (range 3–15). The higher default (10) is intentional — inference queries ("Is he a bad guy?") need broader evidence coverage to draw conclusions from sparse signal.
 
 ---
 
-## Expected Precision@5 by Configuration
+## Expected Precision@10 by Configuration
 
-| Configuration | Estimated P@5 |
+| Configuration | Estimated P@10 |
 |---|---|
-| 512 tokens, k=5, no reranker, no MMR | 0.55–0.65 |
-| 512 tokens, k=5, no reranker, MMR | 0.65–0.75 |
-| 512 tokens, k=5, cross-encoder, MMR | **0.75–0.85** |
-| 512 tokens, k=5, Cohere, MMR | **0.78–0.88** |
+| 512 tokens, k=10, no reranker, no MMR | 0.50–0.60 |
+| 512 tokens, k=10, no reranker, MMR | 0.60–0.70 |
+| 512 tokens, k=10, cross-encoder, MMR | **0.70–0.82** |
+| 512 tokens, k=10, Cohere, MMR | **0.74–0.86** |
 
 Run `scripts/benchmark.py` to measure actual P@5 on your document set.
 
@@ -150,9 +172,9 @@ Run `scripts/benchmark.py` to measure actual P@5 on your document set.
 
 | Retrieval config | Retrieval latency | Total to first token |
 |---|---|---|
-| FAISS, no reranker | ~60ms | ~750–1000ms |
-| FAISS, cross-encoder | ~160ms | ~850–1150ms |
-| FAISS, Cohere reranker | ~350ms | ~1050–1350ms |
-| ChromaDB, no reranker | ~100ms | ~800–1050ms |
+| ChromaDB, no reranker | ~100ms | ~850–1100ms |
+| ChromaDB, cross-encoder | ~200ms | ~950–1200ms |
+| ChromaDB, Cohere reranker | ~400ms | ~1150–1450ms |
+| FAISS, no reranker | ~60ms | ~800–1050ms |
 
 All configurations remain within the 2-second target for time to first token.

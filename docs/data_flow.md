@@ -6,10 +6,12 @@
 
 ```
 Client: POST /api/v1/documents/upload (multipart/form-data)
+        Authorization: Bearer <JWT token>
               │
               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │ API Handler (documents.py)                                      │
+│ 0. get_current_user() validates JWT → injects User              │
 │ 1. Validate MIME = application/pdf                              │
 │ 2. Validate size ≤ MAX_UPLOAD_SIZE_MB                           │
 │ 3. FileUtils.save_upload() → (file_path, document_id)          │
@@ -27,6 +29,8 @@ Client: POST /api/v1/documents/upload (multipart/form-data)
 │ Step 2: PDFProcessorService.parse(file_path, document_id)      │
 │   ├── PyMuPDF (primary): ~100 pages/sec                        │
 │   ├── pdfplumber (fallback if chars_per_page < threshold)      │
+│   ├── Tesseract OCR via pdf2image (fallback if both yield      │
+│   │     < MINIMUM_CHARS_PER_PAGE; DPI=200 rasterization)       │
 │   └── ParsedDocument {pages, pdf_metadata, parser_used}        │
 │   On PDFParsingError → status="error", re-raise                │
 │                                                                 │
@@ -35,8 +39,9 @@ Client: POST /api/v1/documents/upload (multipart/form-data)
 │                                                                 │
 │ Step 4: ChunkerService.chunk(cleaned_text, ..., document_id)   │
 │   ├── Recursive character split: 512 tokens, 64 overlap        │
-│   └── list[Chunk] with {chunk_id, chunk_index, page_numbers,   │
-│         token_count, text, start/end_char_offset}               │
+│   ├── list[Chunk] with {chunk_id, chunk_index, page_numbers,   │
+│   │     token_count, text, start/end_char_offset}               │
+│   └── Zero-chunk guard: if no chunks → status="error", raise   │
 │                                                                 │
 │ Step 5: EmbedderService.embed_chunks(chunks)                   │
 │   ├── Batch OpenAI calls (100 chunks/batch)                    │
@@ -60,11 +65,13 @@ Client: POST /api/v1/documents/upload (multipart/form-data)
 
 ```
 Client: POST /api/v1/query
-        {"question": "...", "session_id": "...", "top_k": 5}
+        Authorization: Bearer <JWT token>
+        {"question": "...", "session_id": "...", "top_k": 10}
               │
               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │ API Handler (query.py)                                          │
+│ 0. get_current_user() validates JWT → injects User              │
 │ 1. Validate QueryRequest (Pydantic)                            │
 │ 2. RAGPipeline.run(question, session_id, document_ids, top_k)  │
 │ 3. Map GeneratedAnswer → QueryResponse                         │
@@ -86,20 +93,25 @@ Client: POST /api/v1/query
 │   HIT  → return cached GeneratedAnswer (cache_hit=True)        │
 │   MISS → continue ↓                                            │
 │                                                                 │
-│ Step 3: Query Reformulation (conditional)                      │
-│   IF turn_count == 0:  standalone_query = raw_query  (0ms)    │
-│   ELSE: QueryReformulator.reformulate(query, history)          │
-│         Example: "What about their revenue?"                   │
-│             → "What was Acme Corp's Q3 2024 revenue?"          │
+│ Step 3: Query Reformulation (always runs)                      │
+│   QueryReformulator.reformulate(query, history)                │
+│   Two purposes:                                                │
+│   a) Resolve follow-up references with conversational history  │
+│         "What about their revenue?"                            │
+│         → "What was Acme Corp's Q3 2024 revenue?"             │
+│   b) Expand inferential/vague queries into search terms        │
+│         "Is he a bad guy?"                                     │
+│         → "professional misconduct unethical behaviour         │
+│             criminal record character flaws"                   │
 │                                                                 │
 │ Step 4: EmbeddingCache.get_or_embed(standalone_query)          │
 │   HIT  → return cached 1536-dim vector  (~1ms)                │
 │   MISS → EmbeddingService.embed_query() → store  (~150ms)     │
 │                                                                 │
 │ Step 5: RetrieverService.retrieve(                             │
-│           query_embedding, document_ids, TOP_K_CANDIDATES=10)  │
-│   Stage 1: VectorStore.search() → top-10 candidates           │
-│   Stage 2: discard score < SIMILARITY_THRESHOLD (0.70)        │
+│           query_embedding, document_ids, TOP_K_CANDIDATES=20)  │
+│   Stage 1: VectorStore.search() → top-20 candidates           │
+│   Stage 2: discard score < SIMILARITY_THRESHOLD (0.0 default) │
 │   Output: list[ScoredChunk] (bi_encoder_score set)             │
 │                                                                 │
 │ Step 6: Reranking (conditional)                                │
@@ -111,9 +123,11 @@ Client: POST /api/v1/query
 │   ELSE: candidates unchanged                                   │
 │   On RerankerError → log warning, fall back to bi-encoder      │
 │                                                                 │
-│ Step 7: RetrieverService.apply_mmr(candidates, top_k=5)        │
-│   MMR: λ·relevance − (1−λ)·max_sim_to_selected               │
-│   Output: final top-5 list[ScoredChunk] (rank set)             │
+│ Step 7: RetrieverService.apply_mmr(candidates, top_k=10)       │
+│   MMR: λ·relevance − (1−λ)·max_diversity_penalty              │
+│   Diversity signal: chunk position distance within same doc;   │
+│   cross-document chunks treated as maximally diverse (sim=0)   │
+│   Output: final top-10 list[ScoredChunk] (rank set)            │
 │                                                                 │
 │ Step 8: MemoryManager.get_formatted_history(                   │
 │           session_id, token_budget=1024)                       │
@@ -181,9 +195,9 @@ Step 2 (ResponseCache) is **skipped** — streaming cannot be replayed.
 |---|---|---|---|
 | Session lookup | <1ms | <1ms | in-memory |
 | Response cache check | <1ms | <1ms | cache hit returns immediately |
-| Query reformulation | 0–300ms | 500ms | skipped on first turn |
+| Query reformulation | 50–300ms | 500ms | runs on every turn |
 | Query embedding | 1–150ms | 300ms | near-zero on cache hit |
-| Vector search | 10–50ms | 100ms | FAISS in-memory |
+| Vector search | 10–100ms | 200ms | ChromaDB default |
 | Threshold filter | <1ms | <1ms | CPU only |
 | Cross-encoder reranking | 0–400ms | 600ms | 0 when disabled |
 | MMR selection | 5–20ms | 50ms | CPU only |

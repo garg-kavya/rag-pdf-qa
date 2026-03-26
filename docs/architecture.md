@@ -18,6 +18,14 @@ Every answer is grounded exclusively in uploaded PDF content. No prior knowledge
                 │                               │
                 ▼                               ▼
 ┌───────────────────────────────────────────────────────────────────┐
+│                   AUTH LAYER  (app/auth/, app/api/v1/auth.py)     │
+│  POST /auth/register   POST /auth/login   GET /auth/me            │
+│  bcrypt password hashing · python-jose JWT · UserStore (SQLite)   │
+│  All /documents, /sessions, /query endpoints require Bearer token │
+└───────────────┬───────────────────────────────┬───────────────────┘
+                │                               │
+                ▼                               ▼
+┌───────────────────────────────────────────────────────────────────┐
 │                      API LAYER  (app/api/)                        │
 │  /documents/upload          /query          /query/stream         │
 │  /sessions                  /health                               │
@@ -71,16 +79,27 @@ Every answer is grounded exclusively in uploaded PDF content. No prior knowledge
 │  (app/db/)      │   │  (app/models/, app/schemas/)             │
 │                 │   │                                          │
 │  VectorStore    │   │  QueryContext, ScoredChunk,              │
-│  FAISSStore     │   │  GeneratedAnswer, PipelineMetadata       │
-│  ChromaStore    │   │  ChunkMetadata, RetrievalMetadata        │
-│  SessionStore   │   │  (typed, validated, single source of     │
-│  DocumentReg.   │   │   truth for all data shapes)             │
+│  ChromaStore ◄──┼── │  GeneratedAnswer, PipelineMetadata       │
+│  FAISSStore     │   │  ChunkMetadata, RetrievalMetadata        │
+│  SessionStore   │   │  User (auth user model)                  │
+│  DocumentReg.   │   │  (typed, validated, single source of     │
+│  UserStore      │   │   truth for all data shapes)             │
 └─────────────────┘   └──────────────────────────────────────────┘
 ```
 
 ---
 
 ## Component Reference
+
+### Auth Layer (`app/auth/`, `app/api/v1/auth.py`)
+
+| Endpoint | Handler | Delegates to |
+|---|---|---|
+| `POST /auth/register` | `auth.py` | `UserStore.create_user()` + bcrypt hash |
+| `POST /auth/login` | `auth.py` | `UserStore.get_by_email()` + `verify_password()` + JWT issue |
+| `GET /auth/me` | `auth.py` | JWT decode → `UserStore.get_by_id()` |
+
+All other endpoints require `Authorization: Bearer <token>`. The `get_current_user` dependency validates the token and injects the `User` model.
 
 ### API Layer (`app/api/`)
 
@@ -108,14 +127,14 @@ Each service has a single responsibility and knows nothing about caches, memory,
 
 | Service | Responsibility |
 |---|---|
-| `pdf_processor` | Parse PDF (PyMuPDF → pdfplumber fallback) |
+| `pdf_processor` | Parse PDF: PyMuPDF → pdfplumber → Tesseract OCR (3-level fallback) |
 | `text_cleaner` | Normalize extracted text (6 operations) |
 | `chunker` | Split text into 512-token chunks with overlap |
 | `embedder` | Batch embed chunks via OpenAI API |
 | `retriever` | Vector search + threshold filter + MMR selection |
 | `reranker` | Cross-encoder second-pass relevance scoring (optional) |
 | `generator` | (moved to chains layer — see below) |
-| `query_reformulator` | Resolve follow-up queries into standalone questions |
+| `query_reformulator` | Always runs: expands vague/follow-up queries into searchable standalone form |
 | `streaming` | Format SSE events from async token generator |
 
 ### Chains Layer (`app/chains/`)
@@ -149,10 +168,11 @@ Narrowed to LLM-only concerns. Called exclusively by `RAGPipeline`.
 | Module | Responsibility |
 |---|---|
 | `vector_store` | Abstract interface: add_chunks, search, delete_document |
+| `chroma_store` | ChromaDB persistent collection (default) |
 | `faiss_store` | FAISS IndexFlatIP + parallel metadata dict |
-| `chroma_store` | ChromaDB persistent collection |
 | `session_store` | Session CRUD with TTL expiry; persists to `data/sessions.json` |
 | `document_registry` | Document status and metadata tracking; persists to `data/registry.json` |
+| `user_store` | User CRUD via aiosqlite; persists to `data/users.db` |
 
 ---
 
@@ -167,14 +187,17 @@ Narrowed to LLM-only concerns. Called exclusively by `RAGPipeline`.
 ### 3. Reranker is Optional and Graceful
 `is_enabled()` guards the reranking step. When disabled, the pipeline is identical to the pre-reranker design (MMR-only). When the reranker fails, it logs a warning and falls back to bi-encoder ordering — the request never fails due to a reranker error.
 
-### 4. Two-Level Caching
+### 4. JWT Auth at the Boundary
+Authentication is enforced at the API layer via FastAPI's `Depends(get_current_user)`. Every protected handler receives a validated `User` object injected by dependency injection — services and pipelines below the API layer are auth-unaware. Tokens are stored in `localStorage` on the frontend and sent as `Authorization: Bearer` headers.
+
+### 5. Two-Level Caching
 - **Embedding cache** (24h): eliminates the most common bottleneck (repeated queries).
 - **Response cache** (60s): eliminates double-submission LLM calls; includes `turn_count` in the key to prevent stale answers.
 
-### 5. Memory Layer Above Storage Layer
+### 6. Memory Layer Above Storage Layer
 `session_store` handles persistence (CRUD, TTL). `memory_manager` handles intelligence (what to keep, how to format it, when to compress). Keeping them separate means the storage layer is replaceable (e.g., Redis) without touching memory logic.
 
-### 6. DocumentRegistry Separates Document State from Vectors
+### 7. DocumentRegistry Separates Document State from Vectors
 Document status, PDF metadata, and ingestion results are stored in `DocumentRegistry`. Chunk vectors are stored in `VectorStore`. Neither knows about the other; `IngestionPipeline` coordinates them.
 
 ---
@@ -183,6 +206,6 @@ Document status, PDF metadata, and ingestion results are stored in `DocumentRegi
 
 | Scale | Vector Store | Sessions | Deployment |
 |---|---|---|---|
-| Dev | FAISS (in-memory) | In-memory dict | Single container |
+| Dev | ChromaDB (persistent) | In-memory dict | Single container |
 | Small prod | ChromaDB (persistent) | In-memory + Redis eviction | Docker Compose |
 | Large prod | Pinecone / Weaviate | Redis Cluster | Kubernetes |

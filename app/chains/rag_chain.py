@@ -193,6 +193,13 @@ class RAGChain:
             retrieved_context.chunks
         )
 
+        # Normalize cosine similarity to [0, 1] against realistic bounds for
+        # text-embedding-3-small (related text scores 0.10–0.55; raw scores used
+        # directly as a multiplier would permanently cap confidence below ~0.35).
+        _SCORE_MIN = 0.10
+        _SCORE_MAX = 0.55
+        normalized = max(0.0, min(1.0, (mean_score - _SCORE_MIN) / (_SCORE_MAX - _SCORE_MIN)))
+
         # Citation density factor
         citation_factor = min(1.0, len(citations) / max(len(retrieved_context.chunks), 1))
 
@@ -200,7 +207,7 @@ class RAGChain:
         uncertainty_phrases = ["i don't know", "i cannot", "not in the document", "no information"]
         penalty = 0.85 if any(p in answer_text.lower() for p in uncertainty_phrases) else 1.0
 
-        return round(min(1.0, mean_score * (0.7 + 0.3 * citation_factor) * penalty), 3)
+        return round(min(1.0, normalized * (0.7 + 0.3 * citation_factor) * penalty), 3)
 
     @staticmethod
     def _citation_to_dict(c: Citation) -> dict:

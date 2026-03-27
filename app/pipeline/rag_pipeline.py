@@ -141,8 +141,10 @@ class RAGPipeline:
         chunks = retrieved_ctx.chunks
         if chunks:
             mean_score = sum(sc.similarity_score for sc in chunks) / len(chunks)
+            _SCORE_MIN, _SCORE_MAX = 0.10, 0.55
+            normalized = max(0.0, min(1.0, (mean_score - _SCORE_MIN) / (_SCORE_MAX - _SCORE_MIN)))
             citation_factor = min(1.0, len(final_citations) / max(len(chunks), 1))
-            confidence = round(min(1.0, mean_score * (0.7 + 0.3 * citation_factor)), 3)
+            confidence = round(min(1.0, normalized * (0.7 + 0.3 * citation_factor)), 3)
         else:
             confidence = 0.0
 

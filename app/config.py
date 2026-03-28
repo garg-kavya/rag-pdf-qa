@@ -63,14 +63,15 @@ class Settings(BaseSettings):
     compression_turns: int = 5
 
     # --- Sessions ---
-    session_ttl_minutes: int = 60
-    max_conversation_turns: int = 10
+    # 0 = never expire (ChatGPT-style persistent conversations)
+    session_ttl_minutes: int = 0
+    max_conversation_turns: int = 100
     session_cleanup_interval_seconds: int = 300
 
     # --- Auth ---
     jwt_secret_key: str = "change-me-in-production-use-a-long-random-string"
     jwt_algorithm: str = "HS256"
-    jwt_access_token_expire_minutes: int = 60 * 24 * 7  # 7 days
+    jwt_access_token_expire_minutes: int = 60 * 24 * 365  # 1 year
 
     # --- Server ---
     host: str = "0.0.0.0"

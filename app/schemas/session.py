@@ -15,7 +15,7 @@ class SessionCreateResponse(BaseModel):
     session_id: str
     document_ids: list[str]
     created_at: datetime
-    expires_at: datetime
+    expires_at: datetime | None = None
     message: str
 
 
@@ -35,7 +35,7 @@ class SessionDetailResponse(BaseModel):
     turn_count: int
     created_at: datetime
     last_active_at: datetime
-    expires_at: datetime
+    expires_at: datetime | None = None
 
 
 class SessionDeleteResponse(BaseModel):

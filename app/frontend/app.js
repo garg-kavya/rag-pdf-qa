@@ -496,7 +496,7 @@ async function streamQuery(question, contentEl, rowEl) {
     clearAuth();
     document.getElementById('mainApp').style.display = 'none';
     document.getElementById('authOverlay').style.display = 'flex';
-    throw new Error('Session expired. Please sign in again.');
+    throw new Error('Your login has expired — please sign in again.');
   }
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({}));
@@ -766,7 +766,7 @@ async function apiFetch(path, method = 'GET', body = undefined) {
     clearAuth();
     document.getElementById('mainApp').style.display = 'none';
     document.getElementById('authOverlay').style.display = 'flex';
-    throw new Error('Session expired. Please sign in again.');
+    throw new Error('Your login has expired — please sign in again.');
   }
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({}));

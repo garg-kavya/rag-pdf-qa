@@ -19,7 +19,11 @@ class SessionStore:
     def __init__(self, settings: Settings, persist_path: str | None = None) -> None:
         self._sessions: dict[str, Session] = {}
         self._lock = asyncio.Lock()
-        self._ttl = timedelta(minutes=settings.session_ttl_minutes)
+        # None = never expire (session_ttl_minutes == 0 → ChatGPT-style persistence)
+        self._ttl: timedelta | None = (
+            timedelta(minutes=settings.session_ttl_minutes)
+            if settings.session_ttl_minutes > 0 else None
+        )
         self._max_turns = settings.max_conversation_turns
         self._persist_path = persist_path
 
@@ -40,7 +44,7 @@ class SessionStore:
             session = self._sessions.get(session_id)
         if session is None:
             return None
-        if datetime.utcnow() - session.last_active_at > self._ttl:
+        if self._ttl is not None and datetime.utcnow() - session.last_active_at > self._ttl:
             return None  # expired; caller raises SessionExpiredError
         return session
 
@@ -82,6 +86,8 @@ class SessionStore:
         return session.turn_count
 
     async def cleanup_expired(self) -> int:
+        if self._ttl is None:
+            return 0  # sessions never expire
         now = datetime.utcnow()
         async with self._lock:
             expired = [
@@ -94,7 +100,9 @@ class SessionStore:
             await self.save_to_disk()
         return len(expired)
 
-    def expires_at(self, session: Session) -> datetime:
+    def expires_at(self, session: Session) -> datetime | None:
+        if self._ttl is None:
+            return None
         return session.last_active_at + self._ttl
 
     # ------------------------------------------------------------------
@@ -124,8 +132,8 @@ class SessionStore:
                 for sid, d in data.items():
                     try:
                         session = self._dict_to_session(d)
-                        # Skip sessions that would already be expired
-                        if datetime.utcnow() - session.last_active_at <= self._ttl:
+                        # Skip sessions that are already expired (unless TTL is disabled)
+                        if self._ttl is None or datetime.utcnow() - session.last_active_at <= self._ttl:
                             self._sessions[sid] = session
                             loaded += 1
                     except Exception:

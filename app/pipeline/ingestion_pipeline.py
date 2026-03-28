@@ -13,6 +13,7 @@ from app.services.embedder import EmbedderService
 from app.services.pdf_processor import PDFProcessorService
 from app.services.text_cleaner import TextCleanerService
 from app.utils.logging import get_logger
+from langsmith import traceable
 
 logger = get_logger(__name__)
 
@@ -39,6 +40,7 @@ class IngestionPipeline:
         self._sessions = session_store
         self._embedding_model = embedding_model
 
+    @traceable(name="pdf-ingestion", run_type="chain")
     async def run(
         self,
         file_path: str,

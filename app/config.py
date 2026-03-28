@@ -46,9 +46,6 @@ class Settings(BaseSettings):
     similarity_threshold: float = 0.0
     mmr_diversity_factor: float = 0.7
 
-    # --- Observability ---
-    helicone_api_key: str | None = None
-
     # --- Reranker ---
     reranker_backend: Literal["none", "cross_encoder", "cohere"] = "none"
     cohere_api_key: str | None = None

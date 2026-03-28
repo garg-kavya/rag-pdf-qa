@@ -5,6 +5,8 @@ import time
 import uuid
 from typing import AsyncGenerator
 
+from langsmith import traceable
+
 from app.cache.embedding_cache import EmbeddingCache
 from app.cache.response_cache import ResponseCache
 from app.chains.rag_chain import RAGChain
@@ -61,6 +63,7 @@ class RAGPipeline:
     # Public interface
     # ------------------------------------------------------------------
 
+    @traceable(name="rag-query", run_type="chain")
     async def run(
         self,
         raw_query: str,
@@ -95,6 +98,7 @@ class RAGPipeline:
         )
         return answer
 
+    @traceable(name="rag-query-stream", run_type="chain")
     async def run_stream(
         self,
         raw_query: str,

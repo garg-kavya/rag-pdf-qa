@@ -1,12 +1,15 @@
-"""Shared AsyncOpenAI client factory.
+"""Shared AsyncOpenAI client factory with LangSmith instrumentation.
 
-Routes all traffic through Helicone when HELICONE_API_KEY is set, giving
-a live dashboard of token usage, costs, latency, and error rates across
-every call — completions, embeddings, reformulation, and compression.
+When LANGCHAIN_TRACING_V2=true and LANGCHAIN_API_KEY are set, every
+OpenAI call (completions, embeddings, reformulation, compression) is
+automatically traced in LangSmith — token counts, cost, latency, full
+prompt/response — with zero changes to the call sites.
 
-Without a key the client connects directly to OpenAI with no overhead.
+Without the env vars the client connects directly to OpenAI.
 """
 from __future__ import annotations
+
+import os
 
 from openai import AsyncOpenAI
 
@@ -14,14 +17,9 @@ from app.config import Settings
 
 
 def make_openai_client(settings: Settings) -> AsyncOpenAI:
-    """Return an AsyncOpenAI client, optionally proxied through Helicone."""
-    if settings.helicone_api_key:
-        return AsyncOpenAI(
-            api_key=settings.openai_api_key,
-            base_url="https://oai.helicone.ai/v1",
-            default_headers={
-                "Helicone-Auth": f"Bearer {settings.helicone_api_key}",
-                "Helicone-Property-App": "DocMind",
-            },
-        )
-    return AsyncOpenAI(api_key=settings.openai_api_key)
+    """Return an AsyncOpenAI client, optionally instrumented via LangSmith."""
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    if os.getenv("LANGCHAIN_TRACING_V2", "").lower() == "true":
+        from langsmith.wrappers import wrap_openai
+        client = wrap_openai(client)
+    return client

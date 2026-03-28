@@ -27,6 +27,9 @@ chromadb==0.6.3
 pytesseract==0.3.13
 pdf2image==1.17.0
 
+# Observability
+langsmith==0.3.45
+
 # Optional — only loaded when enabled via env vars
 # RERANKER_BACKEND=cohere   → cohere
 # RERANKER_BACKEND=cross_encoder → sentence-transformers

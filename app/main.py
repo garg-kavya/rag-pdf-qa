@@ -5,6 +5,7 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 
+import asyncpg
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -38,27 +39,36 @@ async def lifespan(app: FastAPI):
     for key, value in state.items():
         setattr(app.state, key, value)
 
+    # PostgreSQL connection pool — shared across all containers
+    pg_pool = await asyncpg.create_pool(settings.database_url, min_size=2, max_size=10)
+    app.state.user_store._pool = pg_pool
+    app.state.token_blocklist._pool = pg_pool
+
     # Restore persisted state: vectors, document registry, sessions, users
     await app.state.vector_store.load_from_disk()
     await app.state.document_registry.load_from_disk()
     await app.state.session_store.load_from_disk()
     await app.state.user_store.create_table()
+    await app.state.token_blocklist.create_table()
     logger.info("DocMind service started")
 
-    # Background: periodic session cleanup
+    # Background: periodic session cleanup + blocklist pruning
     async def _cleanup_loop():
         store = app.state.session_store
+        blocklist = app.state.token_blocklist
         while True:
             await asyncio.sleep(settings.session_cleanup_interval_seconds)
             removed = await store.cleanup_expired()
             if removed:
                 logger.info("Cleaned up %d expired sessions", removed)
+            await blocklist.cleanup_expired()
 
     cleanup_task = asyncio.create_task(_cleanup_loop())
 
     yield  # app is running
 
     cleanup_task.cancel()
+    await pg_pool.close()
     logger.info("DocMind service shutting down")
 
 

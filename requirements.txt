@@ -18,7 +18,7 @@ httpx==0.28.1
 # Authentication
 python-jose[cryptography]==3.3.0
 bcrypt==4.3.0
-aiosqlite==0.20.0
+asyncpg==0.30.0
 
 # ChromaDB vector store (default)
 chromadb==0.6.3

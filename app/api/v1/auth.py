@@ -1,12 +1,15 @@
-"""Authentication endpoints — register, login, me."""
+"""Authentication endpoints — register, login, me, logout."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from datetime import datetime, timedelta
 
-from app.auth.jwt_handler import create_access_token
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+
+from app.auth.jwt_handler import create_access_token, decode_access_token, oauth2_scheme
 from app.auth.password import hash_password, verify_password
+from app.db.token_blocklist import TokenBlocklist
 from app.db.user_store import UserStore
-from app.dependencies import get_current_user, get_user_store
+from app.dependencies import get_current_user, get_token_blocklist, get_user_store
 from app.models.user import User
 from app.schemas.auth import LoginRequest, RegisterRequest, TokenResponse, UserMeResponse
 
@@ -45,3 +48,21 @@ async def login(
 @router.get("/me", response_model=UserMeResponse)
 async def me(current_user: User = Depends(get_current_user)):
     return UserMeResponse(user_id=current_user.user_id, email=current_user.email)
+
+
+@router.post("/logout", status_code=204)
+async def logout(
+    token: str = Depends(oauth2_scheme),
+    blocklist: TokenBlocklist = Depends(get_token_blocklist),
+):
+    """Revoke the current JWT so it can no longer be used even before it expires."""
+    from jose import JWTError
+    try:
+        payload = decode_access_token(token)
+        jti: str = payload.get("jti", "")
+        exp: int | None = payload.get("exp")
+        if jti and exp:
+            expires_at = datetime.utcfromtimestamp(exp)
+            await blocklist.block(jti, expires_at)
+    except JWTError:
+        pass  # already invalid — nothing to revoke

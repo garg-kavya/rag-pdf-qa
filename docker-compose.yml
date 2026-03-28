@@ -1,13 +1,33 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: docmind
+      POSTGRES_PASSWORD: docmind
+      POSTGRES_DB: docmind
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docmind -d docmind"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   app:
     build: .
     ports:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      DATABASE_URL: postgresql://docmind:docmind@postgres:5432/docmind
     volumes:
       - ./uploads:/app/uploads   # PDF storage
-      - ./data:/app/data         # FAISS index + sessions + registry
+      - ./data:/app/data         # ChromaDB index + sessions + registry
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c",
@@ -16,3 +36,6 @@ services:
       timeout: 10s
       start_period: 20s
       retries: 3
+
+volumes:
+  postgres_data:

@@ -5,7 +5,7 @@ import os
 import uuid
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -257,8 +257,6 @@ async def test_client(tmp_path):
     # Clear cached settings so env vars take effect
     _cached_get_settings.cache_clear()
 
-    _app = create_app()
-
     # Build lightweight test counterparts
     _settings = Settings()
     _session_store = SessionStore(_settings)
@@ -291,27 +289,42 @@ async def test_client(tmp_path):
     from app.models.user import User as _User
     _test_user = _User(email="test@example.com", hashed_password="hashed", user_id="test-user-id")
 
-    _app.dependency_overrides[_deps.get_settings] = lambda: _settings
-    _app.dependency_overrides[_deps.get_session_store] = lambda: _session_store
-    _app.dependency_overrides[_deps.get_document_registry] = lambda: _doc_registry
-    _app.dependency_overrides[_deps.get_vector_store] = lambda: _vec_store
-    _app.dependency_overrides[_deps.get_response_cache] = lambda: _resp_cache
-    _app.dependency_overrides[_deps.get_rag_pipeline] = lambda: _rag_pipeline
-    _app.dependency_overrides[_deps.get_ingestion_pipeline] = lambda: _ingestion_pipeline
-    _app.dependency_overrides[_deps.get_current_user] = lambda: _test_user
+    # Mock asyncpg.create_pool so the lifespan doesn't need a real PostgreSQL server.
+    # UserStore/TokenBlocklist methods are never called in tests because get_current_user
+    # is overridden, but the lifespan still calls create_pool + create_table.
+    _mock_conn = AsyncMock()
+    _mock_conn.__aenter__ = AsyncMock(return_value=_mock_conn)
+    _mock_conn.__aexit__ = AsyncMock(return_value=False)
+    _mock_conn.execute = AsyncMock(return_value=None)
+    _mock_conn.fetchrow = AsyncMock(return_value=None)
+    _mock_pool = MagicMock()
+    _mock_pool.acquire = MagicMock(return_value=_mock_conn)
+    _mock_pool.close = AsyncMock()
 
-    async with AsyncClient(
-        transport=ASGITransport(app=_app), base_url="http://test"
-    ) as client:
-        client._test = SimpleNamespace(
-            settings=_settings,
-            session_store=_session_store,
-            doc_registry=_doc_registry,
-            vec_store=_vec_store,
-            rag_pipeline=_rag_pipeline,
-            ingestion_pipeline=_ingestion_pipeline,
-        )
-        yield client
+    with patch("app.main.asyncpg.create_pool", new=AsyncMock(return_value=_mock_pool)):
+        _app = create_app()
 
-    _app.dependency_overrides.clear()
-    _cached_get_settings.cache_clear()
+        _app.dependency_overrides[_deps.get_settings] = lambda: _settings
+        _app.dependency_overrides[_deps.get_session_store] = lambda: _session_store
+        _app.dependency_overrides[_deps.get_document_registry] = lambda: _doc_registry
+        _app.dependency_overrides[_deps.get_vector_store] = lambda: _vec_store
+        _app.dependency_overrides[_deps.get_response_cache] = lambda: _resp_cache
+        _app.dependency_overrides[_deps.get_rag_pipeline] = lambda: _rag_pipeline
+        _app.dependency_overrides[_deps.get_ingestion_pipeline] = lambda: _ingestion_pipeline
+        _app.dependency_overrides[_deps.get_current_user] = lambda: _test_user
+
+        async with AsyncClient(
+            transport=ASGITransport(app=_app), base_url="http://test"
+        ) as client:
+            client._test = SimpleNamespace(
+                settings=_settings,
+                session_store=_session_store,
+                doc_registry=_doc_registry,
+                vec_store=_vec_store,
+                rag_pipeline=_rag_pipeline,
+                ingestion_pipeline=_ingestion_pipeline,
+            )
+            yield client
+
+        _app.dependency_overrides.clear()
+        _cached_get_settings.cache_clear()

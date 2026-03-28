@@ -68,6 +68,9 @@ class Settings(BaseSettings):
     max_conversation_turns: int = 100
     session_cleanup_interval_seconds: int = 300
 
+    # --- Database ---
+    database_url: str = "postgresql://docmind:docmind@localhost:5432/docmind"
+
     # --- Auth ---
     jwt_secret_key: str = "change-me-in-production-use-a-long-random-string"
     jwt_algorithm: str = "HS256"

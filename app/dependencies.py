@@ -12,6 +12,7 @@ from app.chains.rag_chain import RAGChain
 from app.config import Settings, get_settings
 from app.db.document_registry import DocumentRegistry
 from app.db.session_store import SessionStore
+from app.db.token_blocklist import TokenBlocklist
 from app.db.user_store import UserStore
 from app.db.vector_store import VectorStore
 from app.memory.context_builder import ContextBuilder
@@ -48,7 +49,9 @@ def build_app_state(settings: Settings) -> dict:
     _data_dir = settings.vector_store_path  # e.g. "./data"
     session_store = SessionStore(settings, persist_path=f"{_data_dir}/sessions.json")
     document_registry = DocumentRegistry(persist_path=f"{_data_dir}/registry.json")
-    user_store = UserStore(db_path=f"{_data_dir}/users.db")
+    # pool is injected later in main.py lifespan after asyncpg.create_pool()
+    user_store = UserStore(pool=None)  # type: ignore[arg-type]
+    token_blocklist = TokenBlocklist(pool=None)  # type: ignore[arg-type]
 
     # Cache
     shared_cache = InMemoryCache(
@@ -119,6 +122,7 @@ def build_app_state(settings: Settings) -> dict:
         "session_store": session_store,
         "document_registry": document_registry,
         "user_store": user_store,
+        "token_blocklist": token_blocklist,
         "embedding_cache": embedding_cache,
         "response_cache": response_cache,
         "rag_pipeline": rag_pipeline,
@@ -162,6 +166,10 @@ def get_user_store(request: Request) -> UserStore:
     return request.app.state.user_store
 
 
+def get_token_blocklist(request: Request) -> TokenBlocklist:
+    return request.app.state.token_blocklist
+
+
 async def get_current_user(
     request: Request,
     token: str = Depends(oauth2_scheme),
@@ -174,9 +182,15 @@ async def get_current_user(
     try:
         payload = decode_access_token(token)
         user_id: str = payload.get("sub", "")
+        jti: str = payload.get("jti", "")
         if not user_id:
             raise credentials_exception
     except JWTError:
+        raise credentials_exception
+
+    # Reject tokens that have been explicitly revoked (logout)
+    blocklist: TokenBlocklist = request.app.state.token_blocklist
+    if jti and await blocklist.is_blocked(jti):
         raise credentials_exception
 
     user_store: UserStore = request.app.state.user_store

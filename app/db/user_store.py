@@ -1,9 +1,9 @@
-"""SQLite-backed user store via aiosqlite."""
+"""PostgreSQL-backed user store via asyncpg connection pool."""
 from __future__ import annotations
 
 from datetime import datetime
 
-import aiosqlite
+import asyncpg
 
 from app.models.user import User
 from app.utils.logging import get_logger
@@ -13,62 +13,56 @@ logger = get_logger(__name__)
 
 class UserStore:
 
-    def __init__(self, db_path: str = "./data/users.db") -> None:
-        self._db_path = db_path
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self._pool = pool
 
     async def create_table(self) -> None:
-        async with aiosqlite.connect(self._db_path) as db:
-            await db.execute("""
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id TEXT PRIMARY KEY,
                     email TEXT UNIQUE NOT NULL,
                     hashed_password TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TIMESTAMPTZ NOT NULL
                 )
             """)
-            await db.commit()
-        logger.info("User store ready at %s", self._db_path)
+        logger.info("User store ready (PostgreSQL)")
 
     async def create_user(self, email: str, hashed_password: str) -> User:
         user = User(email=email, hashed_password=hashed_password)
-        async with aiosqlite.connect(self._db_path) as db:
-            await db.execute(
-                "INSERT INTO users (user_id, email, hashed_password, created_at) VALUES (?, ?, ?, ?)",
-                (user.user_id, user.email, user.hashed_password, user.created_at.isoformat()),
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO users (user_id, email, hashed_password, created_at) VALUES ($1, $2, $3, $4)",
+                user.user_id, user.email, user.hashed_password, user.created_at,
             )
-            await db.commit()
         return user
 
     async def get_by_email(self, email: str) -> User | None:
-        async with aiosqlite.connect(self._db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT user_id, email, hashed_password, created_at FROM users WHERE email = ?",
-                (email,),
-            ) as cursor:
-                row = await cursor.fetchone()
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT user_id, email, hashed_password, created_at FROM users WHERE email = $1",
+                email,
+            )
         if row is None:
             return None
         return User(
             user_id=row["user_id"],
             email=row["email"],
             hashed_password=row["hashed_password"],
-            created_at=datetime.fromisoformat(row["created_at"]),
+            created_at=row["created_at"],
         )
 
     async def get_by_id(self, user_id: str) -> User | None:
-        async with aiosqlite.connect(self._db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT user_id, email, hashed_password, created_at FROM users WHERE user_id = ?",
-                (user_id,),
-            ) as cursor:
-                row = await cursor.fetchone()
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT user_id, email, hashed_password, created_at FROM users WHERE user_id = $1",
+                user_id,
+            )
         if row is None:
             return None
         return User(
             user_id=row["user_id"],
             email=row["email"],
             hashed_password=row["hashed_password"],
-            created_at=datetime.fromisoformat(row["created_at"]),
+            created_at=row["created_at"],
         )

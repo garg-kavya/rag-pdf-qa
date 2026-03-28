@@ -288,6 +288,9 @@ async def test_client(tmp_path):
         )
     )
 
+    from app.models.user import User as _User
+    _test_user = _User(email="test@example.com", hashed_password="hashed", user_id="test-user-id")
+
     _app.dependency_overrides[_deps.get_settings] = lambda: _settings
     _app.dependency_overrides[_deps.get_session_store] = lambda: _session_store
     _app.dependency_overrides[_deps.get_document_registry] = lambda: _doc_registry
@@ -295,6 +298,7 @@ async def test_client(tmp_path):
     _app.dependency_overrides[_deps.get_response_cache] = lambda: _resp_cache
     _app.dependency_overrides[_deps.get_rag_pipeline] = lambda: _rag_pipeline
     _app.dependency_overrides[_deps.get_ingestion_pipeline] = lambda: _ingestion_pipeline
+    _app.dependency_overrides[_deps.get_current_user] = lambda: _test_user
 
     async with AsyncClient(
         transport=ASGITransport(app=_app), base_url="http://test"

@@ -26,10 +26,12 @@ from app.services.chunker import ChunkerService
 from app.services.embedder import EmbedderService
 from app.services.pdf_processor import PDFProcessorService
 from app.services.query_reformulator import QueryReformulator
+from app.services.query_router import QueryRouter
 from app.services.reranker import RerankerService
 from app.services.retriever import RetrieverService
 from app.services.streaming import StreamingHandler
 from app.services.text_cleaner import TextCleanerService
+from app.tools.python_repl import PythonREPL
 
 
 def build_app_state(settings: Settings) -> dict:
@@ -73,6 +75,8 @@ def build_app_state(settings: Settings) -> dict:
     retriever = RetrieverService(vector_store, settings)
     reranker = RerankerService(settings)
     reformulator = QueryReformulator(settings)
+    query_router = QueryRouter(settings)
+    python_repl = PythonREPL()
 
     # Memory
     context_builder = ContextBuilder()
@@ -93,6 +97,8 @@ def build_app_state(settings: Settings) -> dict:
         memory_manager=memory_manager,
         rag_chain=rag_chain,
         settings=settings,
+        query_router=query_router,
+        python_repl=python_repl,
     )
 
     pdf_processor = PDFProcessorService()

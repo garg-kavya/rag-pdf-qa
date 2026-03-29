@@ -28,8 +28,10 @@ from app.models.query import (
 )
 from app.schemas.metadata import RetrievalMetadata
 from app.services.query_reformulator import QueryReformulator
+from app.services.query_router import QueryRouter
 from app.services.reranker import RerankerService
 from app.services.retriever import RetrieverService
+from app.tools.python_repl import PythonREPL
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -48,6 +50,8 @@ class RAGPipeline:
         memory_manager: MemoryManager,
         rag_chain: RAGChain,
         settings: Settings,
+        query_router: QueryRouter | None = None,
+        python_repl: PythonREPL | None = None,
     ) -> None:
         self._sessions = session_store
         self._response_cache = response_cache
@@ -58,6 +62,8 @@ class RAGPipeline:
         self._memory = memory_manager
         self._chain = rag_chain
         self._settings = settings
+        self._router = query_router
+        self._repl = python_repl
 
     # ------------------------------------------------------------------
     # Public interface
@@ -83,7 +89,12 @@ class RAGPipeline:
         if not doc_ids:
             raise NoDocumentsError("Session has no documents to query.")
 
-        # Step 2 — response cache check
+        # Step 1b — route: math query → calculator, everything else → RAG
+        route = await self._router.classify(raw_query) if self._router else "rag"
+        if route == "calculator":
+            return await self._run_calculator(raw_query, session_id, doc_ids, top_k, query_id, t_total)
+
+        # Step 2 — response cache check (RAG path only)
         async def generate_fn() -> GeneratedAnswer:
             return await self._run_pipeline(
                 raw_query, session_id, doc_ids, top_k, query_id, t_total
@@ -116,6 +127,15 @@ class RAGPipeline:
         doc_ids = document_ids or session.document_ids
         if not doc_ids:
             raise NoDocumentsError("Session has no documents to query.")
+
+        # Route: math query → calculator stream
+        route = await self._router.classify(raw_query) if self._router else "rag"
+        if route == "calculator":
+            async for chunk in self._run_calculator_stream(
+                raw_query, session_id, doc_ids, top_k, query_id, t_total
+            ):
+                yield chunk
+            return
 
         query_ctx, retrieved_ctx = await self._prepare_context(
             raw_query, session_id, doc_ids, top_k, query_id
@@ -187,6 +207,152 @@ class RAGPipeline:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    async def _calculator_answer(
+        self,
+        raw_query: str,
+        session_id: str,
+        doc_ids: list[str],
+        top_k: int | None,
+        query_id: str,
+        t_total: float,
+    ) -> tuple[str, "RetrievedContext", bool]:
+        """Core calculator logic shared by run() and run_stream().
+
+        Returns (answer_text, retrieved_ctx, fell_back_to_rag).
+        """
+        query_ctx, retrieved_ctx = await self._prepare_context(
+            raw_query, session_id, doc_ids, top_k, query_id
+        )
+
+        context_text = "\n\n".join(
+            f"[{sc.chunk.document_name}, page {sc.chunk.page_numbers}]\n{sc.chunk.text}"
+            for sc in retrieved_ctx.chunks
+        )
+
+        try:
+            assert self._router is not None and self._repl is not None
+            code = await self._router.generate_code(raw_query, context_text)
+            success, output = await self._repl.execute(code)
+        except Exception as exc:
+            logger.warning("Calculator path error: %s — falling back to RAG", exc)
+            return "", retrieved_ctx, True
+
+        if not success or output in ("(no output)", ""):
+            logger.warning("Calculator execution failed: %s — falling back to RAG", output)
+            return "", retrieved_ctx, True
+
+        answer_text = (
+            f"**Calculated Result**\n\n{output}\n\n"
+            f"---\n*Computed via Python code execution — exact, not estimated*"
+        )
+        logger.info("Calculator answered query %s: %s", query_id, output[:120])
+        return answer_text, retrieved_ctx, False
+
+    async def _run_calculator(
+        self,
+        raw_query: str,
+        session_id: str,
+        doc_ids: list[str],
+        top_k: int | None,
+        query_id: str,
+        t_total: float,
+    ) -> GeneratedAnswer:
+        """Calculator path for non-streaming run(). Falls back to RAG on failure."""
+        answer_text, retrieved_ctx, fell_back = await self._calculator_answer(
+            raw_query, session_id, doc_ids, top_k, query_id, t_total
+        )
+        if fell_back:
+            return await self._run_pipeline(raw_query, session_id, doc_ids, top_k, query_id, t_total)
+
+        await self._memory.record_turn(
+            session_id=session_id,
+            user_query=raw_query,
+            standalone_query=raw_query,
+            assistant_response=answer_text,
+            retrieved_chunk_ids=[sc.chunk.chunk_id for sc in retrieved_ctx.chunks],
+            citations=[],
+        )
+
+        meta = retrieved_ctx.retrieval_metadata
+        return GeneratedAnswer(
+            answer_text=answer_text,
+            citations=[],
+            confidence=1.0,
+            query_id=query_id,
+            cache_hit=False,
+            retrieval_context=retrieved_ctx,
+            pipeline_metadata=PipelineMetadata(
+                query_id=query_id,
+                total_time_ms=(time.monotonic() - t_total) * 1000,
+                retrieval_time_ms=meta.retrieval_time_ms,
+                llm_model=self._settings.llm_model,
+                embedding_model=self._settings.embedding_model,
+                route="calculator",
+            ),
+        )
+
+    async def _run_calculator_stream(
+        self,
+        raw_query: str,
+        session_id: str,
+        doc_ids: list[str],
+        top_k: int | None,
+        query_id: str,
+        t_total: float,
+    ) -> AsyncGenerator[StreamingChunk, None]:
+        """Calculator path for streaming run_stream(). Falls back to RAG on failure."""
+        answer_text, retrieved_ctx, fell_back = await self._calculator_answer(
+            raw_query, session_id, doc_ids, top_k, query_id, t_total
+        )
+
+        if fell_back:
+            # Re-enter the streaming RAG path
+            query_ctx, retrieved_ctx = await self._prepare_context(
+                raw_query, session_id, doc_ids, top_k, query_id
+            )
+            full_text = ""
+            final_citations = []
+            async for chunk in self._chain.stream(query_ctx, retrieved_ctx):
+                if chunk.event == "token":
+                    full_text += chunk.data.get("text", "")
+                elif chunk.event == "citation":
+                    final_citations = chunk.data.get("citations", [])
+                yield chunk
+            yield StreamingChunk(
+                event="done",
+                data={"query_id": query_id, "confidence": 0.0,
+                      "retrieval_time_ms": retrieved_ctx.retrieval_metadata.retrieval_time_ms,
+                      "reranker_applied": False, "total_tokens": len(full_text.split())},
+            )
+            return
+
+        # Stream the calculator result word-by-word for consistent UX
+        words = answer_text.split(" ")
+        for word in words:
+            yield StreamingChunk(event="token", data={"text": word + " ", "query_id": query_id})
+
+        yield StreamingChunk(event="citation", data={"citations": [], "query_id": query_id})
+        yield StreamingChunk(
+            event="done",
+            data={
+                "query_id": query_id,
+                "confidence": 1.0,
+                "retrieval_time_ms": retrieved_ctx.retrieval_metadata.retrieval_time_ms,
+                "reranker_applied": False,
+                "total_tokens": len(words),
+                "route": "calculator",
+            },
+        )
+
+        await self._memory.record_turn(
+            session_id=session_id,
+            user_query=raw_query,
+            standalone_query=raw_query,
+            assistant_response=answer_text,
+            retrieved_chunk_ids=[sc.chunk.chunk_id for sc in retrieved_ctx.chunks],
+            citations=[],
+        )
 
     async def _prepare_context(
         self,

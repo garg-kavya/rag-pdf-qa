@@ -64,6 +64,7 @@ class PipelineMetadata:
     reranker_backend: str = "none"
     llm_model: str = "gpt-4o"
     embedding_model: str = "text-embedding-3-small"
+    route: str = "rag"  # "rag" | "calculator"
 
 
 @dataclass

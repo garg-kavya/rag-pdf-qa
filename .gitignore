@@ -47,6 +47,7 @@ htmlcov/
 
 # Claude Code IDE settings
 .claude/
+CLAUDE.md
 
 # Logs
 *.log

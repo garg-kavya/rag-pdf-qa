@@ -215,6 +215,7 @@ class RAGPipeline:
         candidates, retrieval_meta = await self._retriever.retrieve(
             query_embedding=query_embedding,
             document_ids=doc_ids,
+            query_text=standalone_query,
             top_k_candidates=self._settings.top_k_candidates,
         )
         retrieval_ms = (time.monotonic() - t0) * 1000

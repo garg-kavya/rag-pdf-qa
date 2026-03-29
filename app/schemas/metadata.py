@@ -33,6 +33,7 @@ class RetrievalMetadata(BaseModel):
     chunks_used: int = 0
     mmr_applied: bool = False
     reranker_applied: bool = False
+    hybrid_search_applied: bool = False
     similarity_scores: list[float] = Field(default_factory=list)
     top_k_requested: int = 5
     similarity_threshold_used: float = 0.70

@@ -28,7 +28,7 @@ class PGVectorStore(VectorStore):
     # ------------------------------------------------------------------
 
     async def initialize(self) -> None:
-        """Create the table and indexes. Safe to call on every startup."""
+        """Create the table, FTS column, and indexes. Safe to call on every startup."""
         async with self._pool.acquire() as conn:
             await conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS document_chunks (
@@ -44,11 +44,22 @@ class PGVectorStore(VectorStore):
                     embedding         vector({self._dimensions}) NOT NULL
                 )
             """)
+            # Full-text search column: 'simple' dictionary = no stemming, so serial
+            # numbers like "ABX-9942" are preserved as exact tokens.
+            await conn.execute("""
+                ALTER TABLE document_chunks
+                ADD COLUMN IF NOT EXISTS text_search tsvector
+                GENERATED ALWAYS AS (to_tsvector('simple', text)) STORED
+            """)
             await conn.execute("""
                 CREATE INDEX IF NOT EXISTS document_chunks_document_id_idx
                 ON document_chunks (document_id)
             """)
-        logger.info("PGVectorStore ready (dim=%d)", self._dimensions)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS document_chunks_text_search_idx
+                ON document_chunks USING GIN (text_search)
+            """)
+        logger.info("PGVectorStore ready (dim=%d, hybrid search enabled)", self._dimensions)
 
     # ------------------------------------------------------------------
     # VectorStore interface
@@ -143,6 +154,73 @@ class PGVectorStore(VectorStore):
                     end_char_offset=row["end_char_offset"],
                 ),
                 float(row["similarity"]),
+            )
+            for row in rows
+        ]
+
+    async def keyword_search(
+        self,
+        query: str,
+        top_k: int,
+        document_ids: list[str] | None = None,
+    ) -> list[tuple[Chunk, float]]:
+        """BM25-style keyword search using PostgreSQL full-text search.
+
+        Uses the 'simple' dictionary (no stemming) so exact tokens like
+        serial numbers and model codes are matched verbatim.
+        ts_rank_cd scores are normalized to [0, 1] before returning.
+        """
+        try:
+            async with self._pool.acquire() as conn:
+                if document_ids:
+                    rows = await conn.fetch(
+                        """
+                        SELECT chunk_id, document_id, document_name, chunk_index, text,
+                               token_count, page_numbers, start_char_offset, end_char_offset,
+                               ts_rank_cd(text_search, plainto_tsquery('simple', $1)) AS kw_score
+                        FROM document_chunks
+                        WHERE text_search @@ plainto_tsquery('simple', $1)
+                          AND document_id = ANY($2)
+                        ORDER BY kw_score DESC
+                        LIMIT $3
+                        """,
+                        query, document_ids, top_k,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        """
+                        SELECT chunk_id, document_id, document_name, chunk_index, text,
+                               token_count, page_numbers, start_char_offset, end_char_offset,
+                               ts_rank_cd(text_search, plainto_tsquery('simple', $1)) AS kw_score
+                        FROM document_chunks
+                        WHERE text_search @@ plainto_tsquery('simple', $1)
+                        ORDER BY kw_score DESC
+                        LIMIT $2
+                        """,
+                        query, top_k,
+                    )
+        except Exception as exc:
+            raise StorageReadError(f"pgvector keyword search failed: {exc}") from exc
+
+        if not rows:
+            return []
+
+        # Normalize ts_rank_cd scores to [0, 1]
+        max_score = max(float(row["kw_score"]) for row in rows) or 1.0
+        return [
+            (
+                Chunk(
+                    chunk_id=row["chunk_id"],
+                    document_id=row["document_id"],
+                    document_name=row["document_name"],
+                    chunk_index=row["chunk_index"],
+                    text=row["text"],
+                    token_count=row["token_count"],
+                    page_numbers=list(row["page_numbers"]),
+                    start_char_offset=row["start_char_offset"],
+                    end_char_offset=row["end_char_offset"],
+                ),
+                float(row["kw_score"]) / max_score,
             )
             for row in rows
         ]

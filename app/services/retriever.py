@@ -1,4 +1,4 @@
-"""Retrieval Service — vector search, threshold filter, MMR."""
+"""Retrieval Service — hybrid search (vector + BM25), threshold filter, MMR."""
 from __future__ import annotations
 
 import time
@@ -14,6 +14,41 @@ from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+# RRF constant — 60 is the standard value from the original paper.
+_RRF_K = 60
+
+
+def _reciprocal_rank_fusion(
+    vector_results: list[ScoredChunk],
+    keyword_results: list[ScoredChunk],
+) -> list[ScoredChunk]:
+    """Merge two ranked lists into one using Reciprocal Rank Fusion.
+
+    score(d) = Σ 1 / (k + rank_i(d))
+
+    Chunks appearing in both lists get a score from each; chunks in only
+    one list still get their contribution. The merged list is sorted by
+    combined RRF score descending.
+    """
+    rrf_scores: dict[str, float] = {}
+    chunks: dict[str, ScoredChunk] = {}
+
+    for rank, sc in enumerate(vector_results):
+        cid = sc.chunk.chunk_id
+        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + 1.0 / (_RRF_K + rank + 1)
+        chunks[cid] = sc
+
+    for rank, sc in enumerate(keyword_results):
+        cid = sc.chunk.chunk_id
+        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + 1.0 / (_RRF_K + rank + 1)
+        if cid not in chunks:
+            chunks[cid] = sc
+
+    merged = sorted(chunks.values(), key=lambda sc: rrf_scores[sc.chunk.chunk_id], reverse=True)
+    for sc in merged:
+        sc.similarity_score = rrf_scores[sc.chunk.chunk_id]
+    return merged
+
 
 class RetrieverService:
 
@@ -28,47 +63,78 @@ class RetrieverService:
         self,
         query_embedding: list[float],
         document_ids: list[str],
+        query_text: str = "",
         top_k_candidates: int | None = None,
     ) -> tuple[list[ScoredChunk], RetrievalMetadata]:
-        """Stage 1 (vector search) + Stage 2 (threshold filter)."""
+        """Hybrid retrieval: vector search + keyword search merged via RRF.
+
+        Falls back to vector-only if keyword search returns nothing (e.g.
+        very short queries or stores that don't support keyword search).
+        """
         if not document_ids:
             raise NoDocumentsError("No documents to search.")
 
         fetch_k = top_k_candidates or self._top_k_candidates
         t0 = time.monotonic()
 
+        # --- Stage 1a: semantic vector search ---
         try:
-            raw = await self._store.search(query_embedding, top_k=fetch_k, document_ids=document_ids)
+            vector_raw = await self._store.search(
+                query_embedding, top_k=fetch_k, document_ids=document_ids
+            )
         except Exception as exc:
             raise StorageReadError(f"Vector search failed: {exc}") from exc
 
-        elapsed_ms = (time.monotonic() - t0) * 1000
+        # --- Stage 1b: keyword search (BM25-style via PostgreSQL FTS) ---
+        keyword_raw: list[tuple] = []
+        if query_text.strip():
+            try:
+                keyword_raw = await self._store.keyword_search(
+                    query_text, top_k=fetch_k, document_ids=document_ids
+                )
+            except Exception:
+                logger.warning("Keyword search failed, falling back to vector-only")
 
-        # Threshold filter
-        scored: list[ScoredChunk] = []
-        for chunk, score in raw:
-            if score >= self._threshold:
-                scored.append(ScoredChunk(
-                    chunk=chunk,
-                    similarity_score=score,
-                    bi_encoder_score=score,
-                ))
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        hybrid = bool(keyword_raw)
+
+        # --- Stage 2: threshold filter on semantic results ---
+        vector_scored = [
+            ScoredChunk(chunk=chunk, similarity_score=score, bi_encoder_score=score)
+            for chunk, score in vector_raw
+            if score >= self._threshold
+        ]
+        keyword_scored = [
+            ScoredChunk(chunk=chunk, similarity_score=score, bi_encoder_score=score)
+            for chunk, score in keyword_raw
+        ]
+
+        # --- Stage 3: merge with Reciprocal Rank Fusion ---
+        if hybrid:
+            scored = _reciprocal_rank_fusion(vector_scored, keyword_scored)
+            logger.debug(
+                "Hybrid: %d vector + %d keyword → %d after RRF",
+                len(vector_scored), len(keyword_scored), len(scored),
+            )
+        else:
+            scored = vector_scored
 
         meta = RetrievalMetadata(
             retrieval_time_ms=elapsed_ms,
-            candidates_considered=len(raw),
+            candidates_considered=len(vector_raw) + len(keyword_raw),
             candidates_after_threshold=len(scored),
-            chunks_used=0,       # filled after MMR
-            mmr_applied=False,   # filled after MMR
+            chunks_used=0,
+            mmr_applied=False,
             reranker_applied=False,
+            hybrid_search_applied=hybrid,
             similarity_scores=[],
             top_k_requested=self._top_k,
             similarity_threshold_used=self._threshold,
         )
 
         logger.debug(
-            "Retrieved %d/%d candidates above threshold %.2f",
-            len(scored), len(raw), self._threshold,
+            "Retrieved %d candidates (hybrid=%s, %.0fms)",
+            len(scored), hybrid, elapsed_ms,
         )
         return scored, meta
 

@@ -29,6 +29,15 @@ class VectorStore(ABC):
     async def get_collection_stats(self) -> dict:
         """Return total_vectors, total_documents, index_type, dimensions."""
 
+    async def keyword_search(
+        self,
+        query: str,
+        top_k: int,
+        document_ids: list[str] | None = None,
+    ) -> list[tuple[Chunk, float]]:
+        """BM25-style keyword search. Returns empty list for stores that don't support it."""
+        return []
+
     async def save_to_disk(self) -> None:
         """Persist index to disk. No-op for backends with built-in persistence."""
 

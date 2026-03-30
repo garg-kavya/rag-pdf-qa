@@ -15,6 +15,7 @@ from app.schemas.metadata import IngestionMetadata, PDFMetadata
 from app.services.chunker import ChunkerService
 from app.services.embedder import EmbedderService
 from app.services.pdf_processor import PDFProcessorService, PageContent, ParsedDocument
+from app.services.table_extractor import TableExtractorService
 from app.services.text_cleaner import TextCleanerService
 
 
@@ -279,3 +280,93 @@ async def test_ingestion_metadata_parser_used(pipeline, doc_registry, mock_pdf):
     result = await pipeline.run("/tmp/test.pdf", doc_id, "test.pdf")
 
     assert result.parser_used == "pdfplumber"
+
+
+# ---------------------------------------------------------------------------
+# Table extractor integration
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def mock_table_extractor():
+    svc = MagicMock(spec=TableExtractorService)
+    # Returns 2 extra table chunks on top of whatever text chunks exist
+    svc.extract = MagicMock(return_value=[_make_chunk(index=3), _make_chunk(index=4)])
+    return svc
+
+
+@pytest.fixture
+def pipeline_with_extractor(
+    mock_pdf, mock_cleaner, mock_chunker, mock_embedder,
+    mock_vector_store, doc_registry, sess_store, mock_table_extractor,
+) -> IngestionPipeline:
+    return IngestionPipeline(
+        pdf_processor=mock_pdf,
+        text_cleaner=mock_cleaner,
+        chunker=mock_chunker,
+        embedder=mock_embedder,
+        vector_store=mock_vector_store,
+        document_registry=doc_registry,
+        session_store=sess_store,
+        embedding_model="text-embedding-3-small",
+        table_extractor=mock_table_extractor,
+    )
+
+
+async def test_table_extractor_called_when_provided(
+    pipeline_with_extractor, mock_table_extractor, doc_registry
+):
+    doc_id = str(uuid.uuid4())
+    await doc_registry.register(doc_id, "test.pdf", "/tmp/test.pdf", 1024)
+    await pipeline_with_extractor.run("/tmp/test.pdf", doc_id, "test.pdf")
+    mock_table_extractor.extract.assert_called_once()
+
+
+async def test_table_extractor_receives_correct_file_path(
+    pipeline_with_extractor, mock_table_extractor, doc_registry
+):
+    doc_id = str(uuid.uuid4())
+    await doc_registry.register(doc_id, "test.pdf", "/tmp/test.pdf", 1024)
+    await pipeline_with_extractor.run("/tmp/test.pdf", doc_id, "test.pdf")
+    call_kwargs = mock_table_extractor.extract.call_args.kwargs
+    assert call_kwargs["file_path"] == "/tmp/test.pdf"
+
+
+async def test_table_extractor_start_index_equals_text_chunk_count(
+    pipeline_with_extractor, mock_table_extractor, doc_registry
+):
+    """start_index passed to the extractor must equal the number of text chunks."""
+    doc_id = str(uuid.uuid4())
+    await doc_registry.register(doc_id, "test.pdf", "/tmp/test.pdf", 1024)
+    # mock_chunker fixture returns 3 text chunks
+    await pipeline_with_extractor.run("/tmp/test.pdf", doc_id, "test.pdf")
+    call_kwargs = mock_table_extractor.extract.call_args.kwargs
+    assert call_kwargs["start_index"] == 3
+
+
+async def test_total_chunks_includes_table_chunks(pipeline_with_extractor, doc_registry):
+    """result.total_chunks must count both text chunks and table chunks."""
+    doc_id = str(uuid.uuid4())
+    await doc_registry.register(doc_id, "test.pdf", "/tmp/test.pdf", 1024)
+    result = await pipeline_with_extractor.run("/tmp/test.pdf", doc_id, "test.pdf")
+    # mock_chunker → 3 text chunks, mock_table_extractor → 2 table chunks
+    assert result.total_chunks == 5
+
+
+async def test_table_extractor_none_does_not_raise(pipeline, doc_registry):
+    """Default pipeline fixture has table_extractor=None; must run without error."""
+    doc_id = str(uuid.uuid4())
+    await doc_registry.register(doc_id, "test.pdf", "/tmp/test.pdf", 1024)
+    result = await pipeline.run("/tmp/test.pdf", doc_id, "test.pdf")
+    # Only the 3 text chunks from mock_chunker
+    assert result.total_chunks == 3
+
+
+async def test_table_extractor_empty_result_does_not_affect_pipeline(
+    pipeline_with_extractor, mock_table_extractor, doc_registry
+):
+    """When table extractor returns [], pipeline should still succeed with text chunks only."""
+    mock_table_extractor.extract = MagicMock(return_value=[])
+    doc_id = str(uuid.uuid4())
+    await doc_registry.register(doc_id, "test.pdf", "/tmp/test.pdf", 1024)
+    result = await pipeline_with_extractor.run("/tmp/test.pdf", doc_id, "test.pdf")
+    assert result.total_chunks == 3

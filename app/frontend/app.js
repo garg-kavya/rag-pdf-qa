@@ -35,6 +35,63 @@ function switchAuthTab(tab) {
   document.getElementById('registerError').textContent = '';
 }
 
+/* ─── Google OAuth ───────────────────────────────────── */
+function handleGoogleLogin() {
+  window.location.href = '/api/v1/auth/google';
+}
+
+/* ─── Forgot password modal ──────────────────────────── */
+function showForgotPassword(e) {
+  if (e) e.preventDefault();
+  document.getElementById('forgotModal').classList.remove('hidden');
+  document.getElementById('forgotEmail').value = '';
+  document.getElementById('forgotError').textContent = '';
+  document.getElementById('forgotError').classList.add('hidden');
+  document.getElementById('forgotSuccess').textContent = '';
+  document.getElementById('forgotSuccess').classList.add('hidden');
+  document.getElementById('forgotBtn').disabled = false;
+  document.getElementById('forgotBtn').textContent = 'Send Reset Link';
+  setTimeout(() => document.getElementById('forgotEmail').focus(), 50);
+}
+
+function hideForgotPassword() {
+  document.getElementById('forgotModal').classList.add('hidden');
+}
+
+function hideForgotOnBackdrop(e) {
+  if (e.target === document.getElementById('forgotModal')) hideForgotPassword();
+}
+
+async function handleForgotPassword(e) {
+  e.preventDefault();
+  const btn = document.getElementById('forgotBtn');
+  const errEl = document.getElementById('forgotError');
+  const successEl = document.getElementById('forgotSuccess');
+  errEl.textContent = '';
+  errEl.classList.add('hidden');
+  successEl.textContent = '';
+  successEl.classList.add('hidden');
+  btn.disabled = true;
+  btn.textContent = 'Sending…';
+  try {
+    await apiFetch('/api/v1/auth/forgot-password', 'POST', {
+      email: document.getElementById('forgotEmail').value,
+    });
+    successEl.textContent = 'If that email is registered, a reset link has been sent.';
+    successEl.classList.remove('hidden');
+    btn.textContent = 'Sent';
+  } catch (err) {
+    if (err.message.includes('not configured')) {
+      errEl.textContent = 'Email service is not configured on this server.';
+    } else {
+      errEl.textContent = err.message;
+    }
+    errEl.classList.remove('hidden');
+    btn.disabled = false;
+    btn.textContent = 'Send Reset Link';
+  }
+}
+
 async function handleLogin(e) {
   e.preventDefault();
   const btn = document.getElementById('loginBtn');
@@ -47,7 +104,7 @@ async function handleLogin(e) {
       email: document.getElementById('loginEmail').value,
       password: document.getElementById('loginPassword').value,
     });
-    setAuth({ token: data.access_token, user_id: data.user_id, email: data.email });
+    setAuth({ token: data.access_token, user_id: data.user_id, email: data.email, name: data.name || '' });
     showMainApp();
   } catch (err) {
     errEl.textContent = err.message;
@@ -69,7 +126,7 @@ async function handleRegister(e) {
       email: document.getElementById('regEmail').value,
       password: document.getElementById('regPassword').value,
     });
-    setAuth({ token: data.access_token, user_id: data.user_id, email: data.email });
+    setAuth({ token: data.access_token, user_id: data.user_id, email: data.email, name: data.name || '' });
     showMainApp();
   } catch (err) {
     errEl.textContent = err.message;
@@ -79,17 +136,29 @@ async function handleRegister(e) {
   }
 }
 
-function handleLogout() {
-  clearAuth();
-  document.getElementById('mainApp').style.display = 'none';
-  document.getElementById('authOverlay').style.display = 'flex';
+async function handleLogout() {
+  try {
+    const auth = getAuth();
+    if (auth && auth.token) {
+      await apiFetch('/api/v1/auth/logout', 'POST').catch(() => {});
+    }
+  } finally {
+    clearAuth();
+    document.getElementById('mainApp').style.display = 'none';
+    document.getElementById('authOverlay').style.display = 'flex';
+  }
 }
 
 async function showMainApp() {
   const auth = getAuth();
   document.getElementById('authOverlay').style.display = 'none';
   document.getElementById('mainApp').style.display = 'flex';
-  if (auth) document.getElementById('footerUser').textContent = auth.email;
+  if (auth) {
+    document.getElementById('footerUser').textContent = auth.name || auth.email || '';
+    const initial = (auth.name || auth.email || 'U').charAt(0).toUpperCase();
+    const avatarEl = document.getElementById('footerAvatar');
+    if (avatarEl) avatarEl.textContent = initial;
+  }
   // Hydrate sidebar with user's existing documents from the server
   if (auth && auth.token) await refreshDocStatuses();
 }
@@ -146,6 +215,23 @@ const inputHint       = $('inputHint');
 
 /* ─── Bootstrap ─────────────────────────────────────── */
 document.addEventListener('DOMContentLoaded', async () => {
+  // Handle Google OAuth callback: ?access_token=...&user_id=...&email=...
+  const urlParams = new URLSearchParams(window.location.search);
+  const oauthToken = urlParams.get('access_token');
+  const authError  = urlParams.get('auth_error');
+  if (oauthToken) {
+    setAuth({
+      token:   oauthToken,
+      user_id: urlParams.get('user_id') || '',
+      email:   urlParams.get('email') || '',
+      name:    urlParams.get('name') || '',
+    });
+    // Clean URL without reload
+    history.replaceState({}, '', window.location.pathname);
+  } else if (authError) {
+    history.replaceState({}, '', window.location.pathname);
+  }
+
   // Show auth overlay or main app depending on stored token
   const auth = getAuth();
   if (auth && auth.token) {

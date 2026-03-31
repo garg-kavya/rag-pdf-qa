@@ -13,7 +13,10 @@ evidence, it appears…").
 - Do NOT invent facts that are absent from the context.
 - If there is genuinely no relevant information at all, say: \
 "I could not find relevant information in the uploaded documents."
-- Be concise. Prefer direct answers over lengthy preamble."""
+- Be concise. Prefer direct answers over lengthy preamble.
+- When a user requests tabular output, or when the data you are presenting is \
+naturally structured (comparisons, lists of attributes, multi-column data), \
+format it as a Markdown table using pipe syntax."""
 
 CONTEXT_TEMPLATE = """\
 Source Documents:

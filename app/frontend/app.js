@@ -31,8 +31,10 @@ function switchAuthTab(tab) {
   document.getElementById('registerForm').classList.toggle('hidden', tab !== 'register');
   document.getElementById('tabLogin').classList.toggle('active', tab === 'login');
   document.getElementById('tabRegister').classList.toggle('active', tab === 'register');
-  document.getElementById('loginError').textContent = '';
-  document.getElementById('registerError').textContent = '';
+  const _le = document.getElementById('loginError');
+  _le.textContent = ''; _le.classList.add('hidden');
+  const _re = document.getElementById('registerError');
+  _re.textContent = ''; _re.classList.add('hidden');
 }
 
 /* ─── Google OAuth ───────────────────────────────────── */
@@ -96,7 +98,7 @@ async function handleLogin(e) {
   e.preventDefault();
   const btn = document.getElementById('loginBtn');
   const errEl = document.getElementById('loginError');
-  errEl.textContent = '';
+  errEl.textContent = ''; errEl.classList.add('hidden');
   btn.disabled = true;
   btn.textContent = 'Signing in…';
   try {
@@ -108,6 +110,7 @@ async function handleLogin(e) {
     showMainApp();
   } catch (err) {
     errEl.textContent = err.message;
+    errEl.classList.remove('hidden');
   } finally {
     btn.disabled = false;
     btn.textContent = 'Sign In';
@@ -118,7 +121,7 @@ async function handleRegister(e) {
   e.preventDefault();
   const btn = document.getElementById('registerBtn');
   const errEl = document.getElementById('registerError');
-  errEl.textContent = '';
+  errEl.textContent = ''; errEl.classList.add('hidden');
   btn.disabled = true;
   btn.textContent = 'Creating…';
   try {
@@ -130,6 +133,7 @@ async function handleRegister(e) {
     showMainApp();
   } catch (err) {
     errEl.textContent = err.message;
+    errEl.classList.remove('hidden');
   } finally {
     btn.disabled = false;
     btn.textContent = 'Create Account';

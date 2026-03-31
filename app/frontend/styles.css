@@ -193,6 +193,13 @@ input, textarea { font: inherit; }
 .auth-panel { display: flex; flex-direction: column; gap: 14px; }
 .auth-panel.hidden { display: none; }
 
+/* Form inside auth panel needs its own column flex so groups have gaps */
+.auth-panel form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
 /* Google button */
 .btn-google {
   display: flex;
@@ -294,7 +301,10 @@ input, textarea { font: inherit; }
   font-size: 13px;
   color: var(--error);
   min-height: 0;
+  line-height: 0;   /* collapse when empty */
+  overflow: hidden;
 }
+.auth-error:not(:empty) { line-height: 1.5; }
 .auth-error:not(:empty) {
   padding: 9px 12px;
   background: var(--error-bg);

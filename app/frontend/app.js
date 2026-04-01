@@ -256,12 +256,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     history.replaceState({}, '', window.location.pathname);
   }
 
+  // Hide Google buttons if OAuth is not configured on this server
+  try {
+    const r = await fetch('/api/v1/auth/google', { redirect: 'manual' });
+    if (r.status === 501) {
+      document.querySelectorAll('.btn-google').forEach(b => b.style.display = 'none');
+      document.querySelectorAll('.auth-divider').forEach(d => d.style.display = 'none');
+    }
+  } catch (_) {}
+
   // Show auth overlay or main app depending on stored token
   const auth = getAuth();
   if (auth && auth.token) {
     showMainApp();
-  } else {
-    // Auth overlay is visible by default
   }
 
   fileInput.addEventListener('change', e => {
